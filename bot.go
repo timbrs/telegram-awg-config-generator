@@ -13,6 +13,8 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
+const menuFooter = "\n/new — создать\n/status — ключи\n\n/delete — удалить\n\n/cancel — отмена"
+
 type Bot struct {
 	bot        *tele.Bot
 	cfg        *ConfigManager
@@ -60,10 +62,10 @@ func (b *Bot) Start() {
 
 	// Set bot command menu for Telegram UI hints
 	_ = b.bot.SetCommands([]tele.Command{
-		{Text: "status", Description: "Список ключей и их статус"},
 		{Text: "new", Description: "Создать новый ключ"},
-		{Text: "delete", Description: "Удалить ключ"},
+		{Text: "status", Description: "Список ключей и их статус"},
 		{Text: "server", Description: "Выбор активного сервера"},
+		{Text: "delete", Description: "Удалить ключ"},
 		{Text: "cancel", Description: "Отменить текущую операцию"},
 	})
 
@@ -235,18 +237,18 @@ func (b *Bot) sendMainMenu(c tele.Context, uid int64) error {
 		serverLine = fmt.Sprintf("Нет доступных серверов (UID: %d)", uid)
 	} else if len(indices) == 1 {
 		srv := cfg.Servers[indices[0]]
-		serverLine = fmt.Sprintf("🖥 Сервер: %s (%s) /server", srv.Name, srv.IP)
+		serverLine = fmt.Sprintf("🖥 у вас доступен 1 Сервер: %s (%s) /status", srv.Name, srv.IP)
 	} else {
 		activeIdx, ok := b.state.GetActiveServer(uid)
 		if ok {
 			srv := cfg.Servers[activeIdx]
-			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s) — сменить: /server", srv.Name, srv.IP)
+			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s) /server", srv.Name, srv.IP)
 		} else {
 			serverLine = "🖥 Сервер не выбран — выбрать: /server"
 		}
 	}
 
-	return c.Send(fmt.Sprintf("%s\n\n/status — ключи\n/new — создать\n/delete — удалить", serverLine))
+	return c.Send(serverLine + menuFooter)
 }
 
 func editResult(bot *tele.Bot, msg *tele.Message, text string) {
@@ -276,7 +278,7 @@ func statusIcon(handshake string) string {
 		fields := strings.Fields(strings.TrimSpace(p))
 		if len(fields) >= 2 && (fields[1] == "day" || fields[1] == "days") {
 			n, err := strconv.Atoi(fields[0])
-			if err == nil && n >= 7 {
+			if err == nil && n >= 1 {
 				return "💤"
 			}
 		}
@@ -378,7 +380,7 @@ func (b *Bot) handleStatus(c tele.Context, srv ServerConfig) error {
 		icon := statusIcon(handshake)
 		sb.WriteString(fmt.Sprintf("#%d %s  %s%s  ↓%s ↑%s\n", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), rx, tx))
 	}
-	sb.WriteString("Добавить: /new")
+	sb.WriteString(menuFooter)
 
 	editResult(c.Bot(), msg, sb.String())
 	return nil
@@ -389,7 +391,7 @@ func (b *Bot) handleNew(c tele.Context, uid int64, srv ServerConfig) error {
 	b.pendingNew[uid] = true
 	b.mu.Unlock()
 
-	return c.Send(fmt.Sprintf("📝 Новый ключ на сервере %s\nВведите имя (или /cancel для отмены):", srv.Name))
+	return c.Send(fmt.Sprintf("📝 Новый ключ на сервере %s\nВведите имя ключа (или /cancel для отмены):", srv.Name))
 }
 
 func (b *Bot) handleNewCreate(c tele.Context, srv ServerConfig, name string) error {
@@ -449,13 +451,27 @@ func (b *Bot) handleDelete(c tele.Context, srv ServerConfig, args []string) erro
 			return nil
 		}
 
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("🗑 Удаление — сервер: %s\n\n", srv.Name))
-		for _, cl := range clients {
-			sb.WriteString(fmt.Sprintf("#%d %s — %s\n", cl.ID, cl.UserData.ClientName, cl.UserData.AllowedIPs))
-			sb.WriteString(fmt.Sprintf("   🤝 %s  /delete_%d\n\n", cl.UserData.LatestHandshake, cl.ID))
+		// Fetch live stats from awg show
+		liveStats, statsErr := AWGShow(srv)
+		if statsErr != nil {
+			log.Printf("awg show failed: %v", statsErr)
 		}
-		sb.WriteString("Назад: /cancel")
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("🗑 Удаление ключа с сервера: %s\n\n", srv.Name))
+		for _, cl := range clients {
+			handshake := "never"
+			if liveStats != nil {
+				if ps, ok := liveStats[cl.ClientID]; ok {
+					if ps.LatestHandshake != "" {
+						handshake = ps.LatestHandshake
+					}
+				}
+			}
+			icon := statusIcon(handshake)
+			sb.WriteString(fmt.Sprintf("#%d %s  %s%s  /delete_%d\n\n", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), cl.ID))
+		}
+		sb.WriteString(menuFooter)
 
 		editResult(c.Bot(), msg, sb.String())
 		return nil
@@ -527,5 +543,5 @@ func (b *Bot) handleServer(c tele.Context, args []string) error {
 	}
 
 	srv := cfg.Servers[serverIdx]
-	return c.Send(fmt.Sprintf("✅ Активный сервер: %s (%s)\n\nСменить: /server\n\n/status — ключи\n/new — создать\n/delete — удалить", srv.Name, srv.IP))
+	return c.Send(fmt.Sprintf("✅ Активный сервер: %s (%s)\n\n/server - сменить сервер\n", srv.Name, srv.IP) + menuFooter)
 }
