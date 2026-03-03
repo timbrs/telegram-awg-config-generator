@@ -1,0 +1,5 @@
+.idea
+builds
+/config.yaml
+*.md
+*.json
