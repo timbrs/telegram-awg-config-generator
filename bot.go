@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -394,7 +395,13 @@ func (b *Bot) handleNew(c tele.Context, uid int64, srv ServerConfig) error {
 	return c.Send(fmt.Sprintf("📝 Новый ключ на сервере %s\nВведите имя ключа (или /cancel для отмены):", srv.Name))
 }
 
+var validPeerName = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
 func (b *Bot) handleNewCreate(c tele.Context, srv ServerConfig, name string) error {
+	if !validPeerName.MatchString(name) {
+		return c.Send("❌ Имя ключа должно содержать только латинские буквы, цифры, дефис, подчёркивание или точку.\nПример: my-phone, laptop_work")
+	}
+
 	msg := sendLoading(c)
 
 	clientConf, err := AddPeer(srv, name)
@@ -410,7 +417,8 @@ func (b *Bot) handleNewCreate(c tele.Context, srv ServerConfig, name string) err
 		"Скачайте приложение AmneziaWG:\n" +
 		"  Android — play.google.com/store/apps/details?id=org.amnezia.awg\n" +
 		"  iPhone — apps.apple.com/app/amneziawg/id6478942365\n\n" +
-		"Откройте приложение → нажмите «+» → «Импорт из файла» → выберите этот .conf файл."
+		"Откройте приложение → нажмите «+» → «Импорт из файла» → выберите этот .conf файл.\n\n" +
+		"⚠️ При сохранении туннель должен называться на английском, иначе будет ошибка «Невозможно импортировать туннель»."
 	doc := &tele.Document{
 		File:     tele.FromReader(strings.NewReader(clientConf)),
 		FileName: name + ".conf",
@@ -427,7 +435,8 @@ func (b *Bot) handleNewCreate(c tele.Context, srv ServerConfig, name string) err
 		return nil
 	}
 	qrCaption := "📷 Либо QR-код конфигурации\n\n" +
-		"Откройте AmneziaWG → нажмите «+» → «Сканировать QR-код» → наведите камеру на это изображение."
+		"Откройте AmneziaWG → нажмите «+» → «Сканировать QR-код» → наведите камеру на это изображение.\n\n" +
+		"⚠️ При сохранении туннель должен называться на английском!"
 	photo := &tele.Photo{
 		File:    tele.FromReader(bytes.NewReader(png)),
 		Caption: qrCaption,
