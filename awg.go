@@ -390,6 +390,27 @@ func AWGShow(srv ServerConfig) (map[string]PeerStats, error) {
 	return peers, nil
 }
 
+func RenamePeer(srv ServerConfig, pubKey, newName string) error {
+	clients, err := ListClients(srv)
+	if err != nil {
+		return err
+	}
+
+	found := false
+	for i, c := range clients {
+		if c.ClientID == pubKey {
+			clients[i].UserData.ClientName = newName
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("клиент не найден")
+	}
+
+	return writeClientsTable(srv, clients)
+}
+
 func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort string, params *ServerParams) string {
 	var sb strings.Builder
 	sb.WriteString("[Interface]\n")

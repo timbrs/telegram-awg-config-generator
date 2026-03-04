@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,14 +13,46 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
-const menuFooter = "\n/new — создать\n/status — ключи\n\n/delete — удалить\n\n/cancel — отмена"
+// Screen represents the current UI state for a user session.
+type Screen int
+
+const (
+	ScreenMain          Screen = iota
+	ScreenStatus               // status displayed
+	ScreenNewPrompt            // waiting for new key name input
+	ScreenDeletePrompt         // showing list, waiting for delete number
+	ScreenRenamePrompt         // showing list, waiting for rename number
+	ScreenRenamePending        // rename number chosen, waiting for new name
+	ScreenServerList           // server selection
+)
+
+// UserSession tracks the current UI state for a user.
+type UserSession struct {
+	Screen            Screen
+	MessageID         int // ID of the "menu message" we keep editing
+	ChatID            int64
+	PendingClientID   string // pubKey for rename
+	PendingClientName string // current name for rename
+}
+
+// Inline button definitions (Unique must be ≤64 bytes).
+var (
+	btnMenu       = tele.InlineButton{Unique: "menu"}
+	btnStatus     = tele.InlineButton{Unique: "st"}
+	btnRefresh    = tele.InlineButton{Unique: "ref"}
+	btnNew        = tele.InlineButton{Unique: "new"}
+	btnDeleteList = tele.InlineButton{Unique: "dls"}
+	btnRenameList = tele.InlineButton{Unique: "rls"}
+	btnServerList = tele.InlineButton{Unique: "svl"}
+	btnServerSel  = tele.InlineButton{Unique: "sv"}
+)
 
 type Bot struct {
-	bot        *tele.Bot
-	cfg        *ConfigManager
-	state      *State
-	pendingNew map[int64]bool // uid -> waiting for peer name
-	mu         sync.RWMutex
+	bot      *tele.Bot
+	cfg      *ConfigManager
+	state    *State
+	sessions map[int64]*UserSession
+	mu       sync.RWMutex
 }
 
 func NewBot(cfg *ConfigManager) (*Bot, error) {
@@ -38,35 +69,61 @@ func NewBot(cfg *ConfigManager) (*Bot, error) {
 	}
 
 	return &Bot{
-		bot:        b,
-		cfg:        cfg,
-		state:      LoadState(),
-		pendingNew: make(map[int64]bool),
+		bot:      b,
+		cfg:      cfg,
+		state:    LoadState(),
+		sessions: make(map[int64]*UserSession),
 	}, nil
 }
 
-func (b *Bot) Start() {
-	handler := func(c tele.Context) error {
-		return b.handleMessage(c)
+func (b *Bot) getSession(uid, chatID int64) *UserSession {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sessions[uid]
+	if !ok {
+		s = &UserSession{ChatID: chatID}
+		b.sessions[uid] = s
 	}
+	s.ChatID = chatID
+	return s
+}
 
-	// Register slash commands
-	b.bot.Handle("/start", handler)
-	b.bot.Handle("/status", handler)
-	b.bot.Handle("/new", handler)
-	b.bot.Handle("/delete", handler)
-	b.bot.Handle("/server", handler)
-	b.bot.Handle("/cancel", handler)
+func (b *Bot) Start() {
+	// Middleware: private chats only + config reload + panic recovery
+	b.bot.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
+		return func(c tele.Context) error {
+			if c.Chat().Type != tele.ChatPrivate {
+				return nil
+			}
+			if err := b.cfg.CheckReload(); err != nil {
+				log.Printf("Ошибка перезагрузки конфига: %v", err)
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("PANIC в обработчике: %v", r)
+				}
+			}()
+			return next(c)
+		}
+	})
 
-	// Also handle plain text (commands without slash)
-	b.bot.Handle(tele.OnText, handler)
+	// Text commands
+	b.bot.Handle("/start", b.cmdStart)
+	b.bot.Handle("/cancel", b.cmdCancel)
+	b.bot.Handle(tele.OnText, b.onText)
 
-	// Set bot command menu for Telegram UI hints
+	// Callback handlers
+	b.bot.Handle(&btnMenu, b.cbMenu)
+	b.bot.Handle(&btnStatus, b.cbStatus)
+	b.bot.Handle(&btnRefresh, b.cbStatus) // same as status
+	b.bot.Handle(&btnNew, b.cbNew)
+	b.bot.Handle(&btnDeleteList, b.cbDeleteList)
+	b.bot.Handle(&btnRenameList, b.cbRenameList)
+	b.bot.Handle(&btnServerList, b.cbServerList)
+	b.bot.Handle(&btnServerSel, b.cbServerSelect)
+
 	_ = b.bot.SetCommands([]tele.Command{
-		{Text: "new", Description: "Создать новый ключ"},
-		{Text: "status", Description: "Список ключей и их статус"},
-		{Text: "server", Description: "Выбор активного сервера"},
-		{Text: "delete", Description: "Удалить ключ"},
+		{Text: "start", Description: "Главное меню"},
 		{Text: "cancel", Description: "Отменить текущую операцию"},
 	})
 
@@ -74,125 +131,511 @@ func (b *Bot) Start() {
 	b.bot.Start()
 }
 
-func (b *Bot) handleMessage(c tele.Context) error {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("PANIC в обработчике: %v", r)
-			_ = c.Send(fmt.Sprintf("❌ Внутренняя ошибка: %v", r))
+// editOrSend tries to edit the session's menu message; falls back to sending a new one.
+func (b *Bot) editOrSend(s *UserSession, bot *tele.Bot, text string, markup *tele.ReplyMarkup) error {
+	if s.MessageID != 0 {
+		msg := &tele.Message{ID: s.MessageID, Chat: &tele.Chat{ID: s.ChatID}}
+		var err error
+		if markup != nil {
+			_, err = bot.Edit(msg, text, markup)
+		} else {
+			_, err = bot.Edit(msg, text)
 		}
-	}()
-
-	// Only private chats
-	if c.Chat().Type != tele.ChatPrivate {
-		return nil
+		if err == nil {
+			return nil
+		}
+		log.Printf("Edit failed (msg %d): %v", s.MessageID, err)
 	}
 
-	// Reload config if changed
-	if err := b.cfg.CheckReload(); err != nil {
-		log.Printf("Ошибка перезагрузки конфига: %v", err)
+	var sent *tele.Message
+	var err error
+	if markup != nil {
+		sent, err = bot.Send(&tele.Chat{ID: s.ChatID}, text, markup)
+	} else {
+		sent, err = bot.Send(&tele.Chat{ID: s.ChatID}, text)
+	}
+	if err != nil {
+		return err
+	}
+	s.MessageID = sent.ID
+	return nil
+}
+
+// syncMessageID updates session's MessageID from callback context.
+func syncMessageID(s *UserSession, c tele.Context) {
+	if cb := c.Callback(); cb != nil && cb.Message != nil {
+		s.MessageID = cb.Message.ID
+	}
+}
+
+// --- Screen renderers ---
+
+func (b *Bot) showMainMenu(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.Screen = ScreenMain
+
+	cfg := b.cfg.Get()
+	indices := b.cfg.ServersForUser(uid)
+
+	var serverLine string
+	switch {
+	case len(indices) == 0:
+		serverLine = fmt.Sprintf("Нет доступных серверов (UID: %d)", uid)
+	case len(indices) == 1:
+		srv := cfg.Servers[indices[0]]
+		serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
+	default:
+		activeIdx, ok := b.state.GetActiveServer(uid)
+		if ok {
+			srv := cfg.Servers[activeIdx]
+			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
+		} else {
+			serverLine = "🖥 Сервер не выбран"
+		}
+	}
+
+	markup := &tele.ReplyMarkup{}
+	rows := []tele.Row{
+		{markup.Data("📋 Статус", btnStatus.Unique), markup.Data("➕ Новый", btnNew.Unique)},
+		{markup.Data("🗑 Удалить", btnDeleteList.Unique), markup.Data("✏️ Rename", btnRenameList.Unique)},
+	}
+	if len(indices) > 1 {
+		rows = append(rows, tele.Row{markup.Data("🖥 Сервер", btnServerList.Unique)})
+	}
+	markup.Inline(rows...)
+
+	return b.editOrSend(s, bot, serverLine, markup)
+}
+
+func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
+	s.Screen = ScreenStatus
+
+	clients, err := ListClients(srv)
+	if err != nil {
+		return b.showError(s, bot, formatError(srv, "", err, ""))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📋 Сервер: %s\n\n", srv.Name))
+
+	if len(clients) == 0 {
+		sb.WriteString("Клиенты не найдены.")
+	} else {
+		liveStats, statsErr := AWGShow(srv)
+		if statsErr != nil {
+			log.Printf("awg show failed: %v", statsErr)
+		}
+		for _, cl := range clients {
+			handshake := "never"
+			rx, tx := "0 B", "0 B"
+			if liveStats != nil {
+				if ps, ok := liveStats[cl.ClientID]; ok {
+					if ps.LatestHandshake != "" {
+						handshake = ps.LatestHandshake
+					}
+					if ps.TransferRx != "" {
+						rx = ps.TransferRx
+					}
+					if ps.TransferTx != "" {
+						tx = ps.TransferTx
+					}
+				}
+			}
+			icon := statusIcon(handshake)
+			sb.WriteString(fmt.Sprintf("#%d %s  %s%s  ↓%s ↑%s\n", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), rx, tx))
+		}
+	}
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{
+		markup.Data("🔄 Обновить", btnRefresh.Unique),
+		markup.Data("↩ Меню", btnMenu.Unique),
+	})
+
+	return b.editOrSend(s, bot, sb.String(), markup)
+}
+
+func (b *Bot) showNewPrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
+	s.Screen = ScreenNewPrompt
+	text := fmt.Sprintf("📝 Новый ключ на сервере %s\nВведите имя ключа:", srv.Name)
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+
+	return b.editOrSend(s, bot, text, markup)
+}
+
+func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
+	s.Screen = ScreenDeletePrompt
+
+	clients, err := ListClients(srv)
+	if err != nil {
+		return b.showError(s, bot, formatError(srv, "", err, ""))
+	}
+	if len(clients) == 0 {
+		return b.showError(s, bot, fmt.Sprintf("📋 Сервер: %s\n\nКлиенты не найдены.", srv.Name))
+	}
+
+	liveStats, _ := AWGShow(srv)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🗑 Удаление ключа с сервера: %s\n\n", srv.Name))
+	for _, cl := range clients {
+		handshake := "never"
+		if liveStats != nil {
+			if ps, ok := liveStats[cl.ClientID]; ok && ps.LatestHandshake != "" {
+				handshake = ps.LatestHandshake
+			}
+		}
+		icon := statusIcon(handshake)
+		sb.WriteString(fmt.Sprintf("#%d %s  %s%s\n", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake)))
+	}
+	sb.WriteString("\nВведите номер ключа для удаления:")
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+
+	return b.editOrSend(s, bot, sb.String(), markup)
+}
+
+func (b *Bot) showRenamePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
+	s.Screen = ScreenRenamePrompt
+
+	clients, err := ListClients(srv)
+	if err != nil {
+		return b.showError(s, bot, formatError(srv, "", err, ""))
+	}
+	if len(clients) == 0 {
+		return b.showError(s, bot, fmt.Sprintf("📋 Сервер: %s\n\nКлиенты не найдены.", srv.Name))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("✏️ Переименование ключа на сервере: %s\n\n", srv.Name))
+	for _, cl := range clients {
+		sb.WriteString(fmt.Sprintf("#%d %s\n", cl.ID, cl.UserData.ClientName))
+	}
+	sb.WriteString("\nВведите номер ключа для переименования:")
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+
+	return b.editOrSend(s, bot, sb.String(), markup)
+}
+
+func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.Screen = ScreenServerList
+
+	indices := b.cfg.ServersForUser(uid)
+	cfg := b.cfg.Get()
+
+	if len(indices) == 0 {
+		return b.showError(s, bot, fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
+	}
+
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for i, idx := range indices {
+		srv := cfg.Servers[idx]
+		text := fmt.Sprintf("%s (%s)", srv.Name, srv.IP)
+		rows = append(rows, tele.Row{markup.Data(text, btnServerSel.Unique, strconv.Itoa(i+1))})
+	}
+	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	markup.Inline(rows...)
+
+	return b.editOrSend(s, bot, "🖥 Выберите сервер:", markup)
+}
+
+func (b *Bot) showError(s *UserSession, bot *tele.Bot, text string) error {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	return b.editOrSend(s, bot, text, markup)
+}
+
+// --- Command handlers ---
+
+func (b *Bot) cmdStart(c tele.Context) error {
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	s.MessageID = 0 // force new message on /start
+	return b.showMainMenu(s, c.Bot(), uid)
+}
+
+func (b *Bot) cmdCancel(c tele.Context) error {
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	return b.showMainMenu(s, c.Bot(), uid)
+}
+
+// --- Callback handlers ---
+
+func (b *Bot) cbMenu(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	return b.showMainMenu(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbStatus(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	srv, err := b.resolveServer(uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+	return b.showStatus(s, c.Bot(), *srv)
+}
+
+func (b *Bot) cbNew(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	srv, err := b.resolveServer(uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+	return b.showNewPrompt(s, c.Bot(), *srv)
+}
+
+func (b *Bot) cbDeleteList(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	srv, err := b.resolveServer(uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+	return b.showDeletePrompt(s, c.Bot(), *srv)
+}
+
+func (b *Bot) cbRenameList(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	srv, err := b.resolveServer(uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+	return b.showRenamePrompt(s, c.Bot(), *srv)
+}
+
+func (b *Bot) cbServerList(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	return b.showServerList(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbServerSelect(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	data := strings.TrimSpace(c.Callback().Data)
+	num, err := strconv.Atoi(data)
+	if err != nil {
+		return b.showError(s, c.Bot(), "❌ Ошибка выбора сервера.")
+	}
+
+	indices := b.cfg.ServersForUser(uid)
+	if num < 1 || num > len(indices) {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Укажите номер от 1 до %d.", len(indices)))
+	}
+
+	serverIdx := indices[num-1]
+	b.state.SetActiveServer(uid, serverIdx)
+	if err := b.state.Save(); err != nil {
+		log.Printf("Ошибка сохранения state: %v", err)
+	}
+	if err := b.cfg.UpdateLastConnected(serverIdx); err != nil {
+		log.Printf("Ошибка обновления last_connected: %v", err)
+	}
+
+	return b.showMainMenu(s, c.Bot(), uid)
+}
+
+// --- Text input handler ---
+
+func sanitizeName(input string) string {
+	s := strings.ReplaceAll(input, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return strings.TrimSpace(s)
+}
+
+func (b *Bot) onText(c tele.Context) error {
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	text := strings.TrimSpace(c.Message().Text)
+
+	switch s.Screen {
+	case ScreenNewPrompt:
+		return b.handleNewCreate(c, s, text)
+	case ScreenDeletePrompt:
+		return b.handleDeleteByNumber(c, s, text)
+	case ScreenRenamePrompt:
+		return b.handleRenameSelectNumber(c, s, text)
+	case ScreenRenamePending:
+		return b.handleRenameExecute(c, s, text)
+	default:
+		return nil // ignore unrelated text
+	}
+}
+
+func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) error {
+	name := sanitizeName(input)
+	if name == "" {
+		return b.showError(s, c.Bot(), "❌ Имя ключа не может быть пустым.")
 	}
 
 	uid := c.Sender().ID
-	text := strings.TrimSpace(c.Message().Text)
-
-	// Remove leading / if present
-	if strings.HasPrefix(text, "/") {
-		text = text[1:]
-	}
-
-	// Remove @botname suffix from commands
-	if atIdx := strings.Index(text, "@"); atIdx > 0 {
-		spaceIdx := strings.Index(text[atIdx:], " ")
-		if spaceIdx > 0 {
-			text = text[:atIdx] + text[atIdx+spaceIdx:]
-		} else {
-			text = text[:atIdx]
-		}
-	}
-
-	parts := strings.Fields(text)
-	if len(parts) == 0 {
-		return nil
-	}
-
-	cmd := strings.ToLower(parts[0])
-
-	// Handle /delete_N format (clickable delete from list)
-	if strings.HasPrefix(cmd, "delete_") {
-		idStr := strings.TrimPrefix(cmd, "delete_")
-		parts = []string{"delete", idStr}
-		cmd = "delete"
-	}
-
-	// Handle /server_N format (clickable server select)
-	if strings.HasPrefix(cmd, "server_") {
-		numStr := strings.TrimPrefix(cmd, "server_")
-		parts = []string{"server", numStr}
-		cmd = "server"
-	}
-
-	// /cancel — отмена текущей операции, возврат в главное меню
-	if cmd == "cancel" {
-		b.mu.Lock()
-		delete(b.pendingNew, uid)
-		b.mu.Unlock()
-		return b.sendMainMenu(c, uid)
-	}
-
-	// Any command cancels pending state (except free text which is the name)
-	isCommand := cmd == "start" || cmd == "status" || cmd == "new" || cmd == "delete" || cmd == "server"
-
-	// Check if user is in "pending new" state and sent a name (not a command)
-	if !isCommand {
-		b.mu.RLock()
-		pending := b.pendingNew[uid]
-		b.mu.RUnlock()
-		if pending {
-			b.mu.Lock()
-			delete(b.pendingNew, uid)
-			b.mu.Unlock()
-
-			srv, err := b.resolveServer(uid)
-			if err != nil {
-				return c.Send(err.Error())
-			}
-			return b.handleNewCreate(c, *srv, parts[0])
-		}
-		return c.Send("Неизвестная команда. Доступны: /status, /new, /delete, /server")
-	}
-
-	// If user sends another command, cancel pending state
-	b.mu.Lock()
-	delete(b.pendingNew, uid)
-	b.mu.Unlock()
-
-	// /start command — same as main menu
-	if cmd == "start" {
-		return b.sendMainMenu(c, uid)
-	}
-
-	// /server doesn't need SSH, handle separately
-	if cmd == "server" {
-		return b.handleServer(c, parts[1:])
-	}
-
-	// Access check
 	srv, err := b.resolveServer(uid)
 	if err != nil {
-		return c.Send(err.Error())
+		return b.showError(s, c.Bot(), err.Error())
 	}
 
-	switch cmd {
-	case "status":
-		return b.handleStatus(c, *srv)
-	case "new":
-		return b.handleNew(c, uid, *srv)
-	case "delete":
-		return b.handleDelete(c, *srv, parts[1:])
-	default:
-		return c.Send("Неизвестная команда. Доступны: /status, /new, /delete, /server")
+	_ = b.editOrSend(s, c.Bot(), "⏳ Создаю ключ...", nil)
+
+	clientConf, err := AddPeer(*srv, name)
+	if err != nil {
+		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
+
+	s.Screen = ScreenMain
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	_ = b.editOrSend(s, c.Bot(), fmt.Sprintf("✅ Ключ \"%s\" создан на сервере %s", name, srv.Name), markup)
+
+	// Send config as file (separate message — cannot inline-edit files)
+	confCaption := "📄 Конфигурация AmneziaWG\n\n" +
+		"Скачайте приложение AmneziaWG:\n" +
+		"  Android — play.google.com/store/apps/details?id=org.amnezia.awg\n" +
+		"  iPhone — apps.apple.com/app/amneziawg/id6478942365\n\n" +
+		"Откройте приложение → нажмите «+» → «Импорт из файла» → выберите этот .conf файл.\n\n" +
+		"⚠️ При сохранении туннель должен называться на английском, иначе будет ошибка «Невозможно импортировать туннель»."
+	doc := &tele.Document{
+		File:     tele.FromReader(strings.NewReader(clientConf)),
+		FileName: srv.Name + ".conf",
+		Caption:  confCaption,
+	}
+	if err := c.Send(doc); err != nil {
+		return err
+	}
+
+	// Send QR code
+	png, err := qrcode.Encode(clientConf, qrcode.Medium, 256)
+	if err != nil {
+		log.Printf("QR generation failed: %v", err)
+		return nil
+	}
+	qrCaption := "📷 Либо QR-код конфигурации\n\n" +
+		"Откройте AmneziaWG → нажмите «+» → «Сканировать QR-код» → наведите камеру на это изображение.\n\n" +
+		"⚠️ При сохранении туннель должен называться на английском!"
+	photo := &tele.Photo{
+		File:    tele.FromReader(bytes.NewReader(png)),
+		Caption: qrCaption,
+	}
+	return c.Send(photo)
 }
+
+func (b *Bot) handleDeleteByNumber(c tele.Context, s *UserSession, input string) error {
+	num, err := strconv.Atoi(strings.TrimSpace(input))
+	if err != nil {
+		return b.showError(s, c.Bot(), "❌ Введите номер ключа (число).")
+	}
+
+	uid := c.Sender().ID
+	srv, err2 := b.resolveServer(uid)
+	if err2 != nil {
+		return b.showError(s, c.Bot(), err2.Error())
+	}
+
+	_ = b.editOrSend(s, c.Bot(), "⏳ Удаляю...", nil)
+
+	clients, err := ListClients(*srv)
+	if err != nil {
+		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
+	}
+	if num < 1 || num > len(clients) {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. Доступны от 1 до %d.", num, len(clients)))
+	}
+
+	target := clients[num-1]
+	if err := RemovePeer(*srv, target.ClientID); err != nil {
+		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
+	}
+
+	s.Screen = ScreenMain
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	return b.editOrSend(s, c.Bot(), fmt.Sprintf("✅ Ключ #%d (%s) удалён с сервера %s", num, target.UserData.ClientName, srv.Name), markup)
+}
+
+func (b *Bot) handleRenameSelectNumber(c tele.Context, s *UserSession, input string) error {
+	num, err := strconv.Atoi(strings.TrimSpace(input))
+	if err != nil {
+		return b.showError(s, c.Bot(), "❌ Введите номер ключа (число).")
+	}
+
+	uid := c.Sender().ID
+	srv, err2 := b.resolveServer(uid)
+	if err2 != nil {
+		return b.showError(s, c.Bot(), err2.Error())
+	}
+
+	clients, err := ListClients(*srv)
+	if err != nil {
+		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
+	}
+	if num < 1 || num > len(clients) {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. Доступны от 1 до %d.", num, len(clients)))
+	}
+
+	target := clients[num-1]
+	s.Screen = ScreenRenamePending
+	s.PendingClientID = target.ClientID
+	s.PendingClientName = target.UserData.ClientName
+
+	text := fmt.Sprintf("✏️ Переименование ключа #%d (%s)\nВведите новое имя:", num, target.UserData.ClientName)
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleRenameExecute(c tele.Context, s *UserSession, input string) error {
+	newName := sanitizeName(input)
+	if newName == "" {
+		return b.showError(s, c.Bot(), "❌ Имя ключа не может быть пустым.")
+	}
+
+	uid := c.Sender().ID
+	srv, err := b.resolveServer(uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	_ = b.editOrSend(s, c.Bot(), "⏳ Переименовываю...", nil)
+
+	if err := RenamePeer(*srv, s.PendingClientID, newName); err != nil {
+		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
+	}
+
+	s.Screen = ScreenMain
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	return b.editOrSend(s, c.Bot(), fmt.Sprintf("✅ Ключ \"%s\" переименован в \"%s\"", s.PendingClientName, newName), markup)
+}
+
+// --- Shared logic ---
 
 func (b *Bot) resolveServer(uid int64) (*ServerConfig, error) {
 	indices := b.cfg.ServersForUser(uid)
@@ -208,7 +651,7 @@ func (b *Bot) resolveServer(uid int64) (*ServerConfig, error) {
 
 	activeIdx, ok := b.state.GetActiveServer(uid)
 	if !ok {
-		return nil, fmt.Errorf("У вас доступно %d серверов. Используйте /server <#> для выбора.", len(indices))
+		return nil, fmt.Errorf("У вас доступно %d серверов. Выберите сервер в меню.", len(indices))
 	}
 
 	cfg := b.cfg.Get()
@@ -218,48 +661,7 @@ func (b *Bot) resolveServer(uid int64) (*ServerConfig, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("Выбранный сервер больше не доступен. Используйте /server <#> для выбора.")
-}
-
-func sendLoading(c tele.Context) *tele.Message {
-	msg, err := c.Bot().Send(c.Chat(), "⏳ Загружаю...")
-	if err != nil {
-		log.Printf("Ошибка отправки 'Загружаю...': %v", err)
-	}
-	return msg
-}
-
-func (b *Bot) sendMainMenu(c tele.Context, uid int64) error {
-	cfg := b.cfg.Get()
-	indices := b.cfg.ServersForUser(uid)
-
-	var serverLine string
-	if len(indices) == 0 {
-		serverLine = fmt.Sprintf("Нет доступных серверов (UID: %d)", uid)
-	} else if len(indices) == 1 {
-		srv := cfg.Servers[indices[0]]
-		serverLine = fmt.Sprintf("🖥 у вас доступен 1 Сервер: %s (%s) /status", srv.Name, srv.IP)
-	} else {
-		activeIdx, ok := b.state.GetActiveServer(uid)
-		if ok {
-			srv := cfg.Servers[activeIdx]
-			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s) /server", srv.Name, srv.IP)
-		} else {
-			serverLine = "🖥 Сервер не выбран — выбрать: /server"
-		}
-	}
-
-	return c.Send(serverLine + menuFooter)
-}
-
-func editResult(bot *tele.Bot, msg *tele.Message, text string) {
-	if msg == nil {
-		return
-	}
-	_, err := bot.Edit(msg, text)
-	if err != nil {
-		log.Printf("Ошибка редактирования сообщения: %v", err)
-	}
+	return nil, fmt.Errorf("Выбранный сервер больше не доступен. Выберите другой в меню.")
 }
 
 // statusIcon returns emoji based on handshake recency:
@@ -337,220 +739,4 @@ func formatError(srv ServerConfig, cmd string, err error, output string) string 
 		result += fmt.Sprintf("\nОтвет: %s", output)
 	}
 	return result
-}
-
-func (b *Bot) handleStatus(c tele.Context, srv ServerConfig) error {
-	msg := sendLoading(c)
-
-	clients, err := ListClients(srv)
-	if err != nil {
-		editResult(c.Bot(), msg, formatError(srv, "", err, ""))
-		return nil
-	}
-
-	if len(clients) == 0 {
-		editResult(c.Bot(), msg, fmt.Sprintf("📋 Сервер: %s /server\n\nКлиенты не найдены.", srv.Name))
-		return nil
-	}
-
-	// Fetch live stats from awg show
-	liveStats, statsErr := AWGShow(srv)
-	if statsErr != nil {
-		log.Printf("awg show failed: %v", statsErr)
-	}
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📋 Сервер: %s /server\n\n", srv.Name))
-	for _, cl := range clients {
-		handshake := "never"
-		rx := "0 B"
-		tx := "0 B"
-		if liveStats != nil {
-			if ps, ok := liveStats[cl.ClientID]; ok {
-				if ps.LatestHandshake != "" {
-					handshake = ps.LatestHandshake
-				}
-				if ps.TransferRx != "" {
-					rx = ps.TransferRx
-				}
-				if ps.TransferTx != "" {
-					tx = ps.TransferTx
-				}
-			}
-		}
-		icon := statusIcon(handshake)
-		sb.WriteString(fmt.Sprintf("#%d %s  %s%s  ↓%s ↑%s\n", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), rx, tx))
-	}
-	sb.WriteString(menuFooter)
-
-	editResult(c.Bot(), msg, sb.String())
-	return nil
-}
-
-func (b *Bot) handleNew(c tele.Context, uid int64, srv ServerConfig) error {
-	b.mu.Lock()
-	b.pendingNew[uid] = true
-	b.mu.Unlock()
-
-	return c.Send(fmt.Sprintf("📝 Новый ключ на сервере %s\nВведите имя ключа (или /cancel для отмены):", srv.Name))
-}
-
-var validPeerName = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-
-func (b *Bot) handleNewCreate(c tele.Context, srv ServerConfig, name string) error {
-	if !validPeerName.MatchString(name) {
-		return c.Send("❌ Имя ключа должно содержать только латинские буквы, цифры, дефис, подчёркивание или точку.\nПример: my-phone, laptop_work")
-	}
-
-	msg := sendLoading(c)
-
-	clientConf, err := AddPeer(srv, name)
-	if err != nil {
-		editResult(c.Bot(), msg, formatError(srv, "", err, ""))
-		return nil
-	}
-
-	editResult(c.Bot(), msg, fmt.Sprintf("✅ Ключ \"%s\" создан на сервере %s", name, srv.Name))
-
-	// Send config as file
-	confCaption := "📄 Конфигурация AmneziaWG\n\n" +
-		"Скачайте приложение AmneziaWG:\n" +
-		"  Android — play.google.com/store/apps/details?id=org.amnezia.awg\n" +
-		"  iPhone — apps.apple.com/app/amneziawg/id6478942365\n\n" +
-		"Откройте приложение → нажмите «+» → «Импорт из файла» → выберите этот .conf файл.\n\n" +
-		"⚠️ При сохранении туннель должен называться на английском, иначе будет ошибка «Невозможно импортировать туннель»."
-	doc := &tele.Document{
-		File:     tele.FromReader(strings.NewReader(clientConf)),
-		FileName: name + ".conf",
-		Caption:  confCaption,
-	}
-	if err := c.Send(doc); err != nil {
-		return err
-	}
-
-	// Send QR code
-	png, err := qrcode.Encode(clientConf, qrcode.Medium, 256)
-	if err != nil {
-		log.Printf("QR generation failed: %v", err)
-		return nil
-	}
-	qrCaption := "📷 Либо QR-код конфигурации\n\n" +
-		"Откройте AmneziaWG → нажмите «+» → «Сканировать QR-код» → наведите камеру на это изображение.\n\n" +
-		"⚠️ При сохранении туннель должен называться на английском!"
-	photo := &tele.Photo{
-		File:    tele.FromReader(bytes.NewReader(png)),
-		Caption: qrCaption,
-	}
-	return c.Send(photo)
-}
-
-func (b *Bot) handleDelete(c tele.Context, srv ServerConfig, args []string) error {
-	if len(args) == 0 {
-		// No ID — show list with delete commands
-		msg := sendLoading(c)
-
-		clients, err := ListClients(srv)
-		if err != nil {
-			editResult(c.Bot(), msg, formatError(srv, "", err, ""))
-			return nil
-		}
-
-		if len(clients) == 0 {
-			editResult(c.Bot(), msg, fmt.Sprintf("📋 Сервер: %s /server\n\nКлиенты не найдены.", srv.Name))
-			return nil
-		}
-
-		// Fetch live stats from awg show
-		liveStats, statsErr := AWGShow(srv)
-		if statsErr != nil {
-			log.Printf("awg show failed: %v", statsErr)
-		}
-
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("🗑 Удаление ключа с сервера: %s\n\n", srv.Name))
-		for _, cl := range clients {
-			handshake := "never"
-			if liveStats != nil {
-				if ps, ok := liveStats[cl.ClientID]; ok {
-					if ps.LatestHandshake != "" {
-						handshake = ps.LatestHandshake
-					}
-				}
-			}
-			icon := statusIcon(handshake)
-			sb.WriteString(fmt.Sprintf("#%d %s  %s%s  /delete_%d\n\n", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), cl.ID))
-		}
-		sb.WriteString(menuFooter)
-
-		editResult(c.Bot(), msg, sb.String())
-		return nil
-	}
-
-	id, err := strconv.Atoi(args[0])
-	if err != nil {
-		return c.Send("❌ ID должен быть числом.\nПример: /delete 1")
-	}
-
-	msg := sendLoading(c)
-
-	clients, err := ListClients(srv)
-	if err != nil {
-		editResult(c.Bot(), msg, formatError(srv, "", err, ""))
-		return nil
-	}
-
-	if id < 1 || id > len(clients) {
-		editResult(c.Bot(), msg, fmt.Sprintf("❌ Неверный ID: %d. Доступны ID от 1 до %d.", id, len(clients)))
-		return nil
-	}
-
-	target := clients[id-1]
-	err = RemovePeer(srv, target.ClientID)
-	if err != nil {
-		editResult(c.Bot(), msg, formatError(srv, "", err, ""))
-		return nil
-	}
-
-	editResult(c.Bot(), msg, fmt.Sprintf("✅ Ключ #%d (%s) удалён с сервера %s", id, target.UserData.ClientName, srv.Name))
-	return nil
-}
-
-func (b *Bot) handleServer(c tele.Context, args []string) error {
-	uid := c.Sender().ID
-	indices := b.cfg.ServersForUser(uid)
-
-	if len(indices) == 0 {
-		return c.Send(fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
-	}
-
-	cfg := b.cfg.Get()
-
-	if len(args) == 0 {
-		var sb strings.Builder
-		sb.WriteString("Доступные серверы:\n\n")
-		for i, idx := range indices {
-			srv := cfg.Servers[idx]
-			sb.WriteString(fmt.Sprintf("%d. %s (%s) — /server_%d\n", i+1, srv.Name, srv.IP, i+1))
-		}
-		return c.Send(sb.String())
-	}
-
-	num, err := strconv.Atoi(args[0])
-	if err != nil || num < 1 || num > len(indices) {
-		return c.Send(fmt.Sprintf("❌ Укажите номер от 1 до %d.", len(indices)))
-	}
-
-	serverIdx := indices[num-1]
-	b.state.SetActiveServer(uid, serverIdx)
-	if err := b.state.Save(); err != nil {
-		log.Printf("Ошибка сохранения state: %v", err)
-	}
-
-	// Update last_connected in config
-	if err := b.cfg.UpdateLastConnected(serverIdx); err != nil {
-		log.Printf("Ошибка обновления last_connected: %v", err)
-	}
-
-	srv := cfg.Servers[serverIdx]
-	return c.Send(fmt.Sprintf("✅ Активный сервер: %s (%s)\n\n/server - сменить сервер\n", srv.Name, srv.IP) + menuFooter)
 }
