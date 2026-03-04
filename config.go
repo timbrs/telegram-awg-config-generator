@@ -107,6 +107,31 @@ func (cm *ConfigManager) UpdateLastConnected(serverIdx int) error {
 	return nil
 }
 
+func (cm *ConfigManager) RenameServer(serverIdx int, newName string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if serverIdx < 0 || serverIdx >= len(cm.config.Servers) {
+		return fmt.Errorf("индекс сервера %d вне диапазона", serverIdx)
+	}
+
+	cm.config.Servers[serverIdx].Name = newName
+
+	data, err := yaml.Marshal(&cm.config)
+	if err != nil {
+		return fmt.Errorf("сериализация конфига: %w", err)
+	}
+	if err := os.WriteFile(cm.filePath, data, 0644); err != nil {
+		return fmt.Errorf("запись конфига: %w", err)
+	}
+
+	info, err := os.Stat(cm.filePath)
+	if err == nil {
+		cm.modTime = info.ModTime()
+	}
+	return nil
+}
+
 func (cm *ConfigManager) ServersForUser(uid int64) []int {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()

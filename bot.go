@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,13 +18,15 @@ import (
 type Screen int
 
 const (
-	ScreenMain          Screen = iota
-	ScreenStatus               // status displayed
-	ScreenNewPrompt            // waiting for new key name input
-	ScreenDeletePrompt         // showing list, waiting for delete number
-	ScreenRenamePrompt         // showing list, waiting for rename number
-	ScreenRenamePending        // rename number chosen, waiting for new name
-	ScreenServerList           // server selection
+	ScreenMain                Screen = iota
+	ScreenStatus                     // status displayed
+	ScreenNewPrompt                  // waiting for new key name input
+	ScreenDeletePrompt               // showing list, waiting for delete number
+	ScreenRenamePrompt               // showing list, waiting for rename number
+	ScreenRenamePending              // rename number chosen, waiting for new name
+	ScreenServerList                 // server selection
+	ScreenServerRenamePrompt         // server rename: pick which server
+	ScreenServerRenamePending        // server rename: waiting for new name
 )
 
 // UserSession tracks the current UI state for a user.
@@ -33,18 +36,21 @@ type UserSession struct {
 	ChatID            int64
 	PendingClientID   string // pubKey for rename
 	PendingClientName string // current name for rename
+	PendingServerIdx  int    // server index for server rename
 }
 
 // Inline button definitions (Unique must be ≤64 bytes).
 var (
-	btnMenu       = tele.InlineButton{Unique: "menu"}
-	btnStatus     = tele.InlineButton{Unique: "st"}
-	btnRefresh    = tele.InlineButton{Unique: "ref"}
-	btnNew        = tele.InlineButton{Unique: "new"}
-	btnDeleteList = tele.InlineButton{Unique: "dls"}
-	btnRenameList = tele.InlineButton{Unique: "rls"}
-	btnServerList = tele.InlineButton{Unique: "svl"}
-	btnServerSel  = tele.InlineButton{Unique: "sv"}
+	btnMenu         = tele.InlineButton{Unique: "menu"}
+	btnStatus       = tele.InlineButton{Unique: "st"}
+	btnRefresh      = tele.InlineButton{Unique: "ref"}
+	btnNew          = tele.InlineButton{Unique: "new"}
+	btnDeleteList   = tele.InlineButton{Unique: "dls"}
+	btnRenameList   = tele.InlineButton{Unique: "rls"}
+	btnServerList   = tele.InlineButton{Unique: "svl"}
+	btnServerSel    = tele.InlineButton{Unique: "sv"}
+	btnServerRename = tele.InlineButton{Unique: "svrn"}
+	btnServerRenSel = tele.InlineButton{Unique: "svr"}
 )
 
 type Bot struct {
@@ -121,6 +127,8 @@ func (b *Bot) Start() {
 	b.bot.Handle(&btnRenameList, b.cbRenameList)
 	b.bot.Handle(&btnServerList, b.cbServerList)
 	b.bot.Handle(&btnServerSel, b.cbServerSelect)
+	b.bot.Handle(&btnServerRename, b.cbServerRename)
+	b.bot.Handle(&btnServerRenSel, b.cbServerRenameSelect)
 
 	_ = b.bot.SetCommands([]tele.Command{
 		{Text: "start", Description: "Главное меню"},
@@ -338,7 +346,10 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 		text := fmt.Sprintf("%s (%s)", srv.Name, srv.IP)
 		rows = append(rows, tele.Row{markup.Data(text, btnServerSel.Unique, strconv.Itoa(i+1))})
 	}
-	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	rows = append(rows, tele.Row{
+		markup.Data("✏️ Переименовать", btnServerRename.Unique),
+		markup.Data("↩ Меню", btnMenu.Unique),
+	})
 	markup.Inline(rows...)
 
 	return b.editOrSend(s, bot, "🖥 Выберите сервер:", markup)
@@ -464,6 +475,63 @@ func (b *Bot) cbServerSelect(c tele.Context) error {
 	return b.showMainMenu(s, c.Bot(), uid)
 }
 
+func (b *Bot) cbServerRename(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	return b.showServerRenameList(s, c.Bot(), uid)
+}
+
+func (b *Bot) showServerRenameList(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.Screen = ScreenServerRenamePrompt
+
+	indices := b.cfg.ServersForUser(uid)
+	cfg := b.cfg.Get()
+
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for i, idx := range indices {
+		srv := cfg.Servers[idx]
+		text := fmt.Sprintf("%s (%s)", srv.Name, srv.IP)
+		rows = append(rows, tele.Row{markup.Data(text, btnServerRenSel.Unique, strconv.Itoa(i+1))})
+	}
+	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	markup.Inline(rows...)
+
+	return b.editOrSend(s, bot, "✏️ Выберите сервер для переименования:", markup)
+}
+
+func (b *Bot) cbServerRenameSelect(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	data := strings.TrimSpace(c.Callback().Data)
+	num, err := strconv.Atoi(data)
+	if err != nil {
+		return b.showError(s, c.Bot(), "❌ Ошибка выбора сервера.")
+	}
+
+	indices := b.cfg.ServersForUser(uid)
+	if num < 1 || num > len(indices) {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Укажите номер от 1 до %d.", len(indices)))
+	}
+
+	serverIdx := indices[num-1]
+	cfg := b.cfg.Get()
+	srv := cfg.Servers[serverIdx]
+
+	s.Screen = ScreenServerRenamePending
+	s.PendingServerIdx = serverIdx
+
+	text := fmt.Sprintf("✏️ Переименование сервера: %s (%s)\nВведите новое имя:", srv.Name, srv.IP)
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerRename.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
 // --- Text input handler ---
 
 func sanitizeName(input string) string {
@@ -486,6 +554,8 @@ func (b *Bot) onText(c tele.Context) error {
 		return b.handleRenameSelectNumber(c, s, text)
 	case ScreenRenamePending:
 		return b.handleRenameExecute(c, s, text)
+	case ScreenServerRenamePending:
+		return b.handleServerRenameExecute(c, s, text)
 	default:
 		return nil // ignore unrelated text
 	}
@@ -524,7 +594,7 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 		"⚠️ При сохранении туннель должен называться на английском, иначе будет ошибка «Невозможно импортировать туннель»."
 	doc := &tele.Document{
 		File:     tele.FromReader(strings.NewReader(clientConf)),
-		FileName: srv.Name + ".conf",
+		FileName: sanitizeFileName(srv.Name),
 		Caption:  confCaption,
 	}
 	if err := c.Send(doc); err != nil {
@@ -633,6 +703,37 @@ func (b *Bot) handleRenameExecute(c tele.Context, s *UserSession, input string) 
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
 	return b.editOrSend(s, c.Bot(), fmt.Sprintf("✅ Ключ \"%s\" переименован в \"%s\"", s.PendingClientName, newName), markup)
+}
+
+func (b *Bot) handleServerRenameExecute(c tele.Context, s *UserSession, input string) error {
+	newName := sanitizeName(input)
+	if newName == "" {
+		return b.showError(s, c.Bot(), "❌ Имя сервера не может быть пустым.")
+	}
+
+	if err := b.cfg.RenameServer(s.PendingServerIdx, newName); err != nil {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка переименования: %v", err))
+	}
+
+	uid := c.Sender().ID
+	s.Screen = ScreenServerList
+	return b.showServerList(s, c.Bot(), uid)
+}
+
+// sanitizeFileName creates a safe .conf filename for AmneziaWG.
+// WireGuard tunnel names allow only [a-zA-Z0-9_=+.-] and max 15 chars.
+// Format: awg<cleaned_name>.conf
+var reUnsafeFileName = regexp.MustCompile(`[^a-zA-Z0-9_=+.\-]`)
+
+func sanitizeFileName(name string) string {
+	clean := reUnsafeFileName.ReplaceAllString(name, "")
+	if len(clean) > 12 { // "awg" (3) + name (12) = 15 max
+		clean = clean[:12]
+	}
+	if clean == "" {
+		return "amneziawg.conf"
+	}
+	return "awg" + clean + ".conf"
 }
 
 // --- Shared logic ---
