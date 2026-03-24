@@ -19,8 +19,9 @@ type ServerConfig struct {
 }
 
 type AppConfig struct {
-	BotToken string         `yaml:"bot_token"`
-	Servers  []ServerConfig `yaml:"servers"`
+	BotToken  string         `yaml:"bot_token"`
+	AdminUIDs []int64        `yaml:"admin_uids"`
+	Servers   []ServerConfig `yaml:"servers"`
 }
 
 type ConfigManager struct {

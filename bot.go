@@ -37,7 +37,11 @@ type UserSession struct {
 	PendingClientID   string // pubKey for rename
 	PendingClientName string // current name for rename
 	PendingServerIdx  int    // server index for server rename
+	PendingUserMsgIDs []int  // user message IDs to delete after rename
+	Page              int    // current page for paginated lists (0-based)
 }
+
+const clientsPerPage = 30
 
 // Inline button definitions (Unique must be ≤64 bytes).
 var (
@@ -51,6 +55,9 @@ var (
 	btnServerSel    = tele.InlineButton{Unique: "sv"}
 	btnServerRename = tele.InlineButton{Unique: "svrn"}
 	btnServerRenSel = tele.InlineButton{Unique: "svr"}
+	btnPagePrev     = tele.InlineButton{Unique: "ppv"}
+	btnPageNext     = tele.InlineButton{Unique: "pnx"}
+	btnNoop         = tele.InlineButton{Unique: "noop"}
 )
 
 type Bot struct {
@@ -121,7 +128,7 @@ func (b *Bot) Start() {
 	// Callback handlers
 	b.bot.Handle(&btnMenu, b.cbMenu)
 	b.bot.Handle(&btnStatus, b.cbStatus)
-	b.bot.Handle(&btnRefresh, b.cbStatus) // same as status
+	b.bot.Handle(&btnRefresh, b.cbRefresh)
 	b.bot.Handle(&btnNew, b.cbNew)
 	b.bot.Handle(&btnDeleteList, b.cbDeleteList)
 	b.bot.Handle(&btnRenameList, b.cbRenameList)
@@ -129,11 +136,16 @@ func (b *Bot) Start() {
 	b.bot.Handle(&btnServerSel, b.cbServerSelect)
 	b.bot.Handle(&btnServerRename, b.cbServerRename)
 	b.bot.Handle(&btnServerRenSel, b.cbServerRenameSelect)
+	b.bot.Handle(&btnPagePrev, b.cbPagePrev)
+	b.bot.Handle(&btnPageNext, b.cbPageNext)
+	b.bot.Handle(&btnNoop, func(c tele.Context) error { return c.Respond() })
 
 	_ = b.bot.SetCommands([]tele.Command{
 		{Text: "start", Description: "Главное меню"},
 		{Text: "cancel", Description: "Отменить текущую операцию"},
 	})
+
+	b.startReportScheduler()
 
 	log.Println("Бот запущен")
 	b.bot.Start()
@@ -179,6 +191,10 @@ func syncMessageID(s *UserSession, c tele.Context) {
 // --- Screen renderers ---
 
 func (b *Bot) showMainMenu(s *UserSession, bot *tele.Bot, uid int64) error {
+	return b.showMainMenuWithHeader(s, bot, uid, "")
+}
+
+func (b *Bot) showMainMenuWithHeader(s *UserSession, bot *tele.Bot, uid int64, header string) error {
 	s.Screen = ScreenMain
 
 	cfg := b.cfg.Get()
@@ -201,6 +217,11 @@ func (b *Bot) showMainMenu(s *UserSession, bot *tele.Bot, uid int64) error {
 		}
 	}
 
+	text := serverLine
+	if header != "" {
+		text = header + "\n\n" + serverLine
+	}
+
 	markup := &tele.ReplyMarkup{}
 	rows := []tele.Row{
 		{markup.Data("📋 Статус", btnStatus.Unique), markup.Data("➕ Новый", btnNew.Unique)},
@@ -211,7 +232,47 @@ func (b *Bot) showMainMenu(s *UserSession, bot *tele.Bot, uid int64) error {
 	}
 	markup.Inline(rows...)
 
-	return b.editOrSend(s, bot, serverLine, markup)
+	return b.editOrSend(s, bot, text, markup)
+}
+
+// paginateClients returns the slice of clients for the current page and fixes s.Page if out of bounds.
+func paginateClients(clients []ClientEntry, s *UserSession) []ClientEntry {
+	total := len(clients)
+	if total == 0 {
+		s.Page = 0
+		return nil
+	}
+	maxPage := (total - 1) / clientsPerPage
+	if s.Page > maxPage {
+		s.Page = maxPage
+	}
+	if s.Page < 0 {
+		s.Page = 0
+	}
+	start := s.Page * clientsPerPage
+	end := start + clientsPerPage
+	if end > total {
+		end = total
+	}
+	return clients[start:end]
+}
+
+// pageRow builds pagination buttons row if needed.
+func pageRow(markup *tele.ReplyMarkup, page, totalItems int) *tele.Row {
+	if totalItems <= clientsPerPage {
+		return nil
+	}
+	maxPage := (totalItems - 1) / clientsPerPage
+	var btns []tele.Btn
+	if page > 0 {
+		btns = append(btns, markup.Data("⬅️", btnPagePrev.Unique))
+	}
+	btns = append(btns, markup.Data(fmt.Sprintf("%d/%d", page+1, maxPage+1), btnNoop.Unique))
+	if page < maxPage {
+		btns = append(btns, markup.Data("➡️", btnPageNext.Unique))
+	}
+	row := tele.Row(btns)
+	return &row
 }
 
 func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
@@ -223,7 +284,7 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig) error 
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📋 Сервер: %s\n\n", srv.Name))
+	sb.WriteString(fmt.Sprintf("📋 Сервер: %s (всего: %d)\n\n", srv.Name, len(clients)))
 
 	if len(clients) == 0 {
 		sb.WriteString("Клиенты не найдены.")
@@ -232,7 +293,8 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig) error 
 		if statsErr != nil {
 			log.Printf("awg show failed: %v", statsErr)
 		}
-		for _, cl := range clients {
+		page := paginateClients(clients, s)
+		for _, cl := range page {
 			handshake := "never"
 			rx, tx := "0 B", "0 B"
 			if liveStats != nil {
@@ -254,10 +316,15 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig) error 
 	}
 
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(tele.Row{
+	var rows []tele.Row
+	if pr := pageRow(markup, s.Page, len(clients)); pr != nil {
+		rows = append(rows, *pr)
+	}
+	rows = append(rows, tele.Row{
 		markup.Data("🔄 Обновить", btnRefresh.Unique),
 		markup.Data("↩ Меню", btnMenu.Unique),
 	})
+	markup.Inline(rows...)
 
 	return b.editOrSend(s, bot, sb.String(), markup)
 }
@@ -286,8 +353,9 @@ func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) 
 	liveStats, _ := AWGShow(srv)
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🗑 Удаление ключа с сервера: %s\n\n", srv.Name))
-	for _, cl := range clients {
+	sb.WriteString(fmt.Sprintf("🗑 Удаление ключа с сервера: %s (всего: %d)\n\n", srv.Name, len(clients)))
+	page := paginateClients(clients, s)
+	for _, cl := range page {
 		handshake := "never"
 		if liveStats != nil {
 			if ps, ok := liveStats[cl.ClientID]; ok && ps.LatestHandshake != "" {
@@ -300,7 +368,12 @@ func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) 
 	sb.WriteString("\nВведите номер ключа для удаления:")
 
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	var rows []tele.Row
+	if pr := pageRow(markup, s.Page, len(clients)); pr != nil {
+		rows = append(rows, *pr)
+	}
+	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	markup.Inline(rows...)
 
 	return b.editOrSend(s, bot, sb.String(), markup)
 }
@@ -317,14 +390,20 @@ func (b *Bot) showRenamePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) 
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("✏️ Переименование ключа на сервере: %s\n\n", srv.Name))
-	for _, cl := range clients {
+	sb.WriteString(fmt.Sprintf("✏️ Переименование ключа на сервере: %s (всего: %d)\n\n", srv.Name, len(clients)))
+	page := paginateClients(clients, s)
+	for _, cl := range page {
 		sb.WriteString(fmt.Sprintf("#%d %s\n", cl.ID, cl.UserData.ClientName))
 	}
 	sb.WriteString("\nВведите номер ключа для переименования:")
 
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	var rows []tele.Row
+	if pr := pageRow(markup, s.Page, len(clients)); pr != nil {
+		rows = append(rows, *pr)
+	}
+	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
+	markup.Inline(rows...)
 
 	return b.editOrSend(s, bot, sb.String(), markup)
 }
@@ -391,7 +470,21 @@ func (b *Bot) cbStatus(c tele.Context) error {
 	uid := c.Sender().ID
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
+	s.Page = 0
 
+	srv, err := b.resolveServer(uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+	return b.showStatus(s, c.Bot(), *srv)
+}
+
+func (b *Bot) cbRefresh(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	// page preserved
 	srv, err := b.resolveServer(uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
@@ -417,6 +510,7 @@ func (b *Bot) cbDeleteList(c tele.Context) error {
 	uid := c.Sender().ID
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
+	s.Page = 0
 
 	srv, err := b.resolveServer(uid)
 	if err != nil {
@@ -430,6 +524,7 @@ func (b *Bot) cbRenameList(c tele.Context) error {
 	uid := c.Sender().ID
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
+	s.Page = 0
 
 	srv, err := b.resolveServer(uid)
 	if err != nil {
@@ -473,6 +568,43 @@ func (b *Bot) cbServerSelect(c tele.Context) error {
 	}
 
 	return b.showMainMenu(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbPagePrev(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	if s.Page > 0 {
+		s.Page--
+	}
+	return b.redrawCurrentScreen(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbPageNext(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	s.Page++
+	return b.redrawCurrentScreen(s, c.Bot(), uid)
+}
+
+func (b *Bot) redrawCurrentScreen(s *UserSession, bot *tele.Bot, uid int64) error {
+	srv, err := b.resolveServer(uid)
+	if err != nil {
+		return b.showError(s, bot, err.Error())
+	}
+	switch s.Screen {
+	case ScreenStatus:
+		return b.showStatus(s, bot, *srv)
+	case ScreenDeletePrompt:
+		return b.showDeletePrompt(s, bot, *srv)
+	case ScreenRenamePrompt:
+		return b.showRenamePrompt(s, bot, *srv)
+	default:
+		return b.showMainMenu(s, bot, uid)
+	}
 }
 
 func (b *Bot) cbServerRename(c tele.Context) error {
@@ -580,41 +712,36 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
 
-	s.Screen = ScreenMain
-	markup := &tele.ReplyMarkup{}
-	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
-	_ = b.editOrSend(s, c.Bot(), fmt.Sprintf("✅ Ключ \"%s\" создан на сервере %s", name, srv.Name), markup)
-
-	// Send config as file (separate message — cannot inline-edit files)
+	// Send config as file
 	confCaption := "📄 Конфигурация AmneziaWG\n\n" +
 		"Скачайте приложение AmneziaWG:\n" +
 		"  Android — play.google.com/store/apps/details?id=org.amnezia.awg\n" +
 		"  iPhone — apps.apple.com/app/amneziawg/id6478942365\n\n" +
-		"Откройте приложение → нажмите «+» → «Импорт из файла» → выберите этот .conf файл.\n\n" +
-		"⚠️ При сохранении туннель должен называться на английском, иначе будет ошибка «Невозможно импортировать туннель»."
+		"Откройте приложение → нажмите «+» → «Импорт из файла» → выберите этот .conf файл."
 	doc := &tele.Document{
 		File:     tele.FromReader(strings.NewReader(clientConf)),
 		FileName: sanitizeFileName(srv.Name),
 		Caption:  confCaption,
 	}
-	if err := c.Send(doc); err != nil {
-		return err
-	}
+	_ = c.Send(doc)
 
 	// Send QR code
 	png, err := qrcode.Encode(clientConf, qrcode.Medium, 256)
 	if err != nil {
 		log.Printf("QR generation failed: %v", err)
-		return nil
+	} else {
+		qrCaption := "📷 Либо QR-код конфигурации\n\n" +
+			"Откройте AmneziaWG → нажмите «+» → «Сканировать QR-код» → наведите камеру на это изображение."
+		photo := &tele.Photo{
+			File:    tele.FromReader(bytes.NewReader(png)),
+			Caption: qrCaption,
+		}
+		_ = c.Send(photo)
 	}
-	qrCaption := "📷 Либо QR-код конфигурации\n\n" +
-		"Откройте AmneziaWG → нажмите «+» → «Сканировать QR-код» → наведите камеру на это изображение.\n\n" +
-		"⚠️ При сохранении туннель должен называться на английском!"
-	photo := &tele.Photo{
-		File:    tele.FromReader(bytes.NewReader(png)),
-		Caption: qrCaption,
-	}
-	return c.Send(photo)
+
+	// Show main menu with success header
+	s.MessageID = 0 // force new message for menu
+	return b.showMainMenuWithHeader(s, c.Bot(), uid, fmt.Sprintf("✅ Ключ \"%s\" создан на сервере %s", name, srv.Name))
 }
 
 func (b *Bot) handleDeleteByNumber(c tele.Context, s *UserSession, input string) error {
@@ -644,10 +771,7 @@ func (b *Bot) handleDeleteByNumber(c tele.Context, s *UserSession, input string)
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
 
-	s.Screen = ScreenMain
-	markup := &tele.ReplyMarkup{}
-	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
-	return b.editOrSend(s, c.Bot(), fmt.Sprintf("✅ Ключ #%d (%s) удалён с сервера %s", num, target.UserData.ClientName, srv.Name), markup)
+	return b.showMainMenuWithHeader(s, c.Bot(), uid, fmt.Sprintf("✅ Ключ #%d (%s) удалён с сервера %s", num, target.UserData.ClientName, srv.Name))
 }
 
 func (b *Bot) handleRenameSelectNumber(c tele.Context, s *UserSession, input string) error {
@@ -674,6 +798,7 @@ func (b *Bot) handleRenameSelectNumber(c tele.Context, s *UserSession, input str
 	s.Screen = ScreenRenamePending
 	s.PendingClientID = target.ClientID
 	s.PendingClientName = target.UserData.ClientName
+	s.PendingUserMsgIDs = []int{c.Message().ID}
 
 	text := fmt.Sprintf("✏️ Переименование ключа #%d (%s)\nВведите новое имя:", num, target.UserData.ClientName)
 	markup := &tele.ReplyMarkup{}
@@ -687,6 +812,13 @@ func (b *Bot) handleRenameExecute(c tele.Context, s *UserSession, input string) 
 		return b.showError(s, c.Bot(), "❌ Имя ключа не может быть пустым.")
 	}
 
+	// Collect second user message and delete both
+	s.PendingUserMsgIDs = append(s.PendingUserMsgIDs, c.Message().ID)
+	for _, msgID := range s.PendingUserMsgIDs {
+		_ = c.Bot().Delete(&tele.Message{ID: msgID, Chat: &tele.Chat{ID: s.ChatID}})
+	}
+	s.PendingUserMsgIDs = nil
+
 	uid := c.Sender().ID
 	srv, err := b.resolveServer(uid)
 	if err != nil {
@@ -699,10 +831,7 @@ func (b *Bot) handleRenameExecute(c tele.Context, s *UserSession, input string) 
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
 
-	s.Screen = ScreenMain
-	markup := &tele.ReplyMarkup{}
-	markup.Inline(tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
-	return b.editOrSend(s, c.Bot(), fmt.Sprintf("✅ Ключ \"%s\" переименован в \"%s\"", s.PendingClientName, newName), markup)
+	return b.showMainMenuWithHeader(s, c.Bot(), uid, fmt.Sprintf("✅ Ключ \"%s\" переименован в \"%s\"", s.PendingClientName, newName))
 }
 
 func (b *Bot) handleServerRenameExecute(c tele.Context, s *UserSession, input string) error {

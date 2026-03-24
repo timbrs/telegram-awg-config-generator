@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -387,6 +388,44 @@ func AWGShow(srv ServerConfig) (map[string]PeerStats, error) {
 		peers[curPeer] = cur
 	}
 
+	return peers, nil
+}
+
+// PeerTraffic holds raw byte counts from "awg show <iface> dump".
+type PeerTraffic struct {
+	PubKey string
+	Rx     int64
+	Tx     int64
+}
+
+// AWGShowDump runs "awg show <iface> dump" and returns raw byte counts per peer.
+func AWGShowDump(srv ServerConfig) ([]PeerTraffic, error) {
+	output, err := dockerExec(srv, fmt.Sprintf("awg show %s dump", ifaceName))
+	if err != nil {
+		return nil, fmt.Errorf("awg show dump: %w", err)
+	}
+
+	var peers []PeerTraffic
+	for i, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		if i == 0 {
+			continue // skip interface line
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 8 {
+			continue
+		}
+		// fields: public-key, preshared-key, endpoint, allowed-ips, latest-handshake, transfer-rx, transfer-tx, persistent-keepalive
+		rx, err1 := strconv.ParseInt(fields[5], 10, 64)
+		tx, err2 := strconv.ParseInt(fields[6], 10, 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		peers = append(peers, PeerTraffic{
+			PubKey: fields[0],
+			Rx:     rx,
+			Tx:     tx,
+		})
+	}
 	return peers, nil
 }
 

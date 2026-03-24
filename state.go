@@ -9,14 +9,24 @@ import (
 
 const stateFilePath = "state.json"
 
+// TrafficSnapshot stores per-peer byte counts at a point in time.
+type TrafficSnapshot struct {
+	Time  string            `json:"time"`            // RFC3339
+	Peers map[string]int64  `json:"peers"`           // pubKey -> rx+tx bytes
+}
+
 // State persists user preferences across bot restarts.
 type State struct {
-	mu           sync.RWMutex
-	ActiveServer map[int64]int `json:"active_server"` // uid -> server index
+	mu               sync.RWMutex
+	ActiveServer     map[int64]int                `json:"active_server"`      // uid -> server index
+	TrafficSnapshots map[int]*TrafficSnapshot     `json:"traffic_snapshots"`  // server index -> last snapshot
 }
 
 func LoadState() *State {
-	s := &State{ActiveServer: make(map[int64]int)}
+	s := &State{
+		ActiveServer:     make(map[int64]int),
+		TrafficSnapshots: make(map[int]*TrafficSnapshot),
+	}
 
 	data, err := os.ReadFile(stateFilePath)
 	if err != nil {
@@ -25,7 +35,8 @@ func LoadState() *State {
 
 	// JSON keys are strings, so we unmarshal into a temp map
 	var raw struct {
-		ActiveServer map[string]int `json:"active_server"`
+		ActiveServer     map[string]int                    `json:"active_server"`
+		TrafficSnapshots map[string]*TrafficSnapshot       `json:"traffic_snapshots"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return s
@@ -38,6 +49,13 @@ func LoadState() *State {
 		}
 	}
 
+	for k, v := range raw.TrafficSnapshots {
+		idx, err := strconv.Atoi(k)
+		if err == nil {
+			s.TrafficSnapshots[idx] = v
+		}
+	}
+
 	return s
 }
 
@@ -45,13 +63,20 @@ func (s *State) Save() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Convert int64 keys to strings for JSON
+	// Convert int64/int keys to strings for JSON
 	raw := struct {
-		ActiveServer map[string]int `json:"active_server"`
-	}{ActiveServer: make(map[string]int)}
+		ActiveServer     map[string]int              `json:"active_server"`
+		TrafficSnapshots map[string]*TrafficSnapshot `json:"traffic_snapshots"`
+	}{
+		ActiveServer:     make(map[string]int),
+		TrafficSnapshots: make(map[string]*TrafficSnapshot),
+	}
 
 	for k, v := range s.ActiveServer {
 		raw.ActiveServer[strconv.FormatInt(k, 10)] = v
+	}
+	for k, v := range s.TrafficSnapshots {
+		raw.TrafficSnapshots[strconv.Itoa(k)] = v
 	}
 
 	data, err := json.MarshalIndent(raw, "", "  ")
@@ -71,5 +96,17 @@ func (s *State) GetActiveServer(uid int64) (int, bool) {
 func (s *State) SetActiveServer(uid int64, idx int) {
 	s.mu.Lock()
 	s.ActiveServer[uid] = idx
+	s.mu.Unlock()
+}
+
+func (s *State) GetTrafficSnapshot(serverIdx int) *TrafficSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.TrafficSnapshots[serverIdx]
+}
+
+func (s *State) SetTrafficSnapshot(serverIdx int, snap *TrafficSnapshot) {
+	s.mu.Lock()
+	s.TrafficSnapshots[serverIdx] = snap
 	s.mu.Unlock()
 }
