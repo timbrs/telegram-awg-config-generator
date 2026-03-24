@@ -235,6 +235,73 @@ func (b *Bot) showMainMenuWithHeader(s *UserSession, bot *tele.Bot, uid int64, h
 	return b.editOrSend(s, bot, text, markup)
 }
 
+// showLoading re-renders the main menu with an hourglass on the pressed button.
+func (b *Bot) showLoading(s *UserSession, bot *tele.Bot, uid int64, loadingBtn string) {
+	cfg := b.cfg.Get()
+	indices := b.cfg.ServersForUser(uid)
+
+	var serverLine string
+	switch {
+	case len(indices) == 0:
+		serverLine = fmt.Sprintf("Нет доступных серверов (UID: %d)", uid)
+	case len(indices) == 1:
+		srv := cfg.Servers[indices[0]]
+		serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
+	default:
+		activeIdx, ok := b.state.GetActiveServer(uid)
+		if ok {
+			srv := cfg.Servers[activeIdx]
+			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
+		} else {
+			serverLine = "🖥 Сервер не выбран"
+		}
+	}
+
+	type btnDef struct {
+		label  string
+		unique string
+	}
+	buttons := []btnDef{
+		{"📋 Статус", btnStatus.Unique},
+		{"➕ Новый", btnNew.Unique},
+		{"🗑 Удалить", btnDeleteList.Unique},
+		{"✏️ Rename", btnRenameList.Unique},
+	}
+	for i, bd := range buttons {
+		if bd.unique == loadingBtn {
+			buttons[i].label = "⏳ " + bd.label
+		}
+	}
+
+	markup := &tele.ReplyMarkup{}
+	rows := []tele.Row{
+		{markup.Data(buttons[0].label, buttons[0].unique), markup.Data(buttons[1].label, buttons[1].unique)},
+		{markup.Data(buttons[2].label, buttons[2].unique), markup.Data(buttons[3].label, buttons[3].unique)},
+	}
+	if len(indices) > 1 {
+		rows = append(rows, tele.Row{markup.Data("🖥 Сервер", btnServerList.Unique)})
+	}
+	markup.Inline(rows...)
+
+	_ = b.editOrSend(s, bot, serverLine, markup)
+}
+
+// showStatusLoading shows hourglass on the Refresh button while data is loading.
+func (b *Bot) showStatusLoading(s *UserSession, bot *tele.Bot) {
+	if s.MessageID == 0 {
+		return
+	}
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	rows = append(rows, tele.Row{
+		markup.Data("⏳ Обновить", btnRefresh.Unique),
+		markup.Data("↩ Меню", btnMenu.Unique),
+	})
+	markup.Inline(rows...)
+	msg := &tele.Message{ID: s.MessageID, Chat: &tele.Chat{ID: s.ChatID}}
+	_, _ = bot.EditReplyMarkup(msg, markup)
+}
+
 // paginateClients returns the slice of clients for the current page and fixes s.Page if out of bounds.
 func paginateClients(clients []ClientEntry, s *UserSession) []ClientEntry {
 	total := len(clients)
@@ -472,6 +539,8 @@ func (b *Bot) cbStatus(c tele.Context) error {
 	syncMessageID(s, c)
 	s.Page = 0
 
+	b.showLoading(s, c.Bot(), uid, btnStatus.Unique)
+
 	srv, err := b.resolveServer(uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
@@ -484,7 +553,9 @@ func (b *Bot) cbRefresh(c tele.Context) error {
 	uid := c.Sender().ID
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
-	// page preserved
+
+	b.showStatusLoading(s, c.Bot())
+
 	srv, err := b.resolveServer(uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
@@ -512,6 +583,8 @@ func (b *Bot) cbDeleteList(c tele.Context) error {
 	syncMessageID(s, c)
 	s.Page = 0
 
+	b.showLoading(s, c.Bot(), uid, btnDeleteList.Unique)
+
 	srv, err := b.resolveServer(uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
@@ -525,6 +598,8 @@ func (b *Bot) cbRenameList(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 	s.Page = 0
+
+	b.showLoading(s, c.Bot(), uid, btnRenameList.Unique)
 
 	srv, err := b.resolveServer(uid)
 	if err != nil {
