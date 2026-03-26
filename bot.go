@@ -235,27 +235,13 @@ func (b *Bot) showMainMenuWithHeader(s *UserSession, bot *tele.Bot, uid int64, h
 	return b.editOrSend(s, bot, text, markup)
 }
 
-// showLoading re-renders the main menu with an hourglass on the pressed button.
+// showLoading updates only the inline keyboard, adding ⏳ to the pressed button.
 func (b *Bot) showLoading(s *UserSession, bot *tele.Bot, uid int64, loadingBtn string) {
-	cfg := b.cfg.Get()
-	indices := b.cfg.ServersForUser(uid)
-
-	var serverLine string
-	switch {
-	case len(indices) == 0:
-		serverLine = fmt.Sprintf("Нет доступных серверов (UID: %d)", uid)
-	case len(indices) == 1:
-		srv := cfg.Servers[indices[0]]
-		serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
-	default:
-		activeIdx, ok := b.state.GetActiveServer(uid)
-		if ok {
-			srv := cfg.Servers[activeIdx]
-			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
-		} else {
-			serverLine = "🖥 Сервер не выбран"
-		}
+	if s.MessageID == 0 {
+		return
 	}
+
+	indices := b.cfg.ServersForUser(uid)
 
 	type btnDef struct {
 		label  string
@@ -283,7 +269,8 @@ func (b *Bot) showLoading(s *UserSession, bot *tele.Bot, uid int64, loadingBtn s
 	}
 	markup.Inline(rows...)
 
-	_ = b.editOrSend(s, bot, serverLine, markup)
+	msg := &tele.Message{ID: s.MessageID, Chat: &tele.Chat{ID: s.ChatID}}
+	_, _ = bot.EditReplyMarkup(msg, markup)
 }
 
 // showStatusLoading shows hourglass on the Refresh button while data is loading.
@@ -292,23 +279,33 @@ func (b *Bot) showStatusLoading(s *UserSession, bot *tele.Bot) {
 		return
 	}
 	markup := &tele.ReplyMarkup{}
-	var rows []tele.Row
-	rows = append(rows, tele.Row{
+	markup.Inline(tele.Row{
 		markup.Data("⏳ Обновить", btnRefresh.Unique),
 		markup.Data("↩ Меню", btnMenu.Unique),
 	})
-	markup.Inline(rows...)
 	msg := &tele.Message{ID: s.MessageID, Chat: &tele.Chat{ID: s.ChatID}}
 	_, _ = bot.EditReplyMarkup(msg, markup)
 }
 
 // paginateClients returns the slice of clients for the current page and fixes s.Page if out of bounds.
+// reverseClients returns clients in reverse order (newest first) while preserving their IDs.
+func reverseClients(clients []ClientEntry) []ClientEntry {
+	n := len(clients)
+	rev := make([]ClientEntry, n)
+	for i, cl := range clients {
+		rev[n-1-i] = cl
+	}
+	return rev
+}
+
 func paginateClients(clients []ClientEntry, s *UserSession) []ClientEntry {
 	total := len(clients)
 	if total == 0 {
 		s.Page = 0
 		return nil
 	}
+	// Show newest clients first
+	clients = reverseClients(clients)
 	maxPage := (total - 1) / clientsPerPage
 	if s.Page > maxPage {
 		s.Page = maxPage
@@ -782,36 +779,53 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 
 	_ = b.editOrSend(s, c.Bot(), "⏳ Создаю ключ...", nil)
 
-	clientConf, err := AddPeer(*srv, name)
+	clientConf, vpnURI, err := AddPeer(*srv, name)
 	if err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
 
-	// Send config as file
-	confCaption := "📄 Конфигурация AmneziaWG\n\n" +
-		"Скачайте приложение AmneziaWG:\n" +
-		"  Android — play.google.com/store/apps/details?id=org.amnezia.awg\n" +
-		"  iPhone — apps.apple.com/app/amneziawg/id6478942365\n\n" +
-		"Откройте приложение → нажмите «+» → «Импорт из файла» → выберите этот .conf файл."
-	doc := &tele.Document{
+	// Send album: .conf file + QR image
+	awgPNG, awgErr := buildQRPng(clientConf, qrcode.High, awgIconData, "iPhone — AmneziaWG")
+	if awgErr != nil {
+		log.Printf("AmneziaWG QR generation failed: %v", awgErr)
+	}
+
+	confCaption := "📄 Конфигурация\n\n" +
+		"Скачайте приложение:\n" +
+		"  iPhone — apps.apple.com/app/amneziawg/id6478942365\n" +
+		"  Android — play.google.com/store/apps/details?id=org.amnezia.vpn\n" +
+		"  PC, Mac — github.com/amnezia-vpn/amnezia-client/releases\n\n" +
+		"iPhone: AmneziaWG → «+» → добавьте .conf файл или отсканируйте QR.\n" +
+		"Android: откройте .conf файл → «Открыть в AmneziaVPN»."
+
+	confDoc := &tele.Document{
 		File:     tele.FromReader(strings.NewReader(clientConf)),
 		FileName: sanitizeFileName(srv.Name),
 		Caption:  confCaption,
 	}
-	_ = c.Send(doc)
 
-	// Send QR code
-	png, err := qrcode.Encode(clientConf, qrcode.Medium, 256)
-	if err != nil {
-		log.Printf("QR generation failed: %v", err)
-	} else {
-		qrCaption := "📷 Либо QR-код конфигурации\n\n" +
-			"Откройте AmneziaWG → нажмите «+» → «Сканировать QR-код» → наведите камеру на это изображение."
-		photo := &tele.Photo{
-			File:    tele.FromReader(bytes.NewReader(png)),
-			Caption: qrCaption,
+	if awgPNG != nil {
+		qrDoc := &tele.Document{
+			File:     tele.FromReader(bytes.NewReader(awgPNG)),
+			FileName: "qr_amneziawg.png",
 		}
-		_ = c.Send(photo)
+		_ = c.SendAlbum(tele.Album{confDoc, qrDoc})
+	} else {
+		_ = c.Send(confDoc)
+	}
+
+	// Send AmneziaVPN key as text message
+	if vpnURI != "" {
+		vpnText := "📱 Ключ для AmneziaVPN\n\n" +
+			"Скопируйте ключ (нажмите на него) → откройте AmneziaVPN → «+» → «Вставить ключ из буфера обмена».\n\n" +
+			"<blockquote expandable><code>" + vpnURI + "</code></blockquote>"
+		_, err := c.Bot().Send(&tele.Chat{ID: c.Sender().ID}, vpnText, &tele.SendOptions{
+			ParseMode:             tele.ModeHTML,
+			DisableWebPagePreview: true,
+		})
+		if err != nil {
+			log.Printf("AmneziaVPN key send failed: %v", err)
+		}
 	}
 
 	// Show main menu with success header
@@ -837,8 +851,13 @@ func (b *Bot) handleDeleteByNumber(c tele.Context, s *UserSession, input string)
 	if err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
-	if num < 1 || num > len(clients) {
-		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. Доступны от 1 до %d.", num, len(clients)))
+
+	// Validate number is within currently displayed page
+	page := paginateClients(clients, s)
+	pageStart := s.Page*clientsPerPage + 1
+	pageEnd := pageStart + len(page) - 1
+	if num < pageStart || num > pageEnd {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. На текущей странице доступны от %d до %d.", num, pageStart, pageEnd))
 	}
 
 	target := clients[num-1]
@@ -865,8 +884,13 @@ func (b *Bot) handleRenameSelectNumber(c tele.Context, s *UserSession, input str
 	if err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
-	if num < 1 || num > len(clients) {
-		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. Доступны от 1 до %d.", num, len(clients)))
+
+	// Validate number is within currently displayed page
+	page := paginateClients(clients, s)
+	pageStart := s.Page*clientsPerPage + 1
+	pageEnd := pageStart + len(page) - 1
+	if num < pageStart || num > pageEnd {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. На текущей странице доступны от %d до %d.", num, pageStart, pageEnd))
 	}
 
 	target := clients[num-1]

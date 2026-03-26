@@ -15,13 +15,13 @@ type ServerConfig struct {
 	Login         string    `yaml:"login"`
 	Pass          string    `yaml:"pass"`
 	AllowedUIDs   []int64   `yaml:"allowed_uids"`
+	ReportUIDs    []int64   `yaml:"report_uids"`
 	LastConnected time.Time `yaml:"last_connected"`
 }
 
 type AppConfig struct {
-	BotToken  string         `yaml:"bot_token"`
-	AdminUIDs []int64        `yaml:"admin_uids"`
-	Servers   []ServerConfig `yaml:"servers"`
+	BotToken string         `yaml:"bot_token"`
+	Servers  []ServerConfig `yaml:"servers"`
 }
 
 type ConfigManager struct {

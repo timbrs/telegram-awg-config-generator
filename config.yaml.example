@@ -5,5 +5,7 @@ servers:
       login: root
       pass: abcdefg
       allowed_uids:
-        - 12345678
+          - 12345678
+      report_uids:
+          - 12345678
       last_connected: 2000-01-01T00:00:00Z

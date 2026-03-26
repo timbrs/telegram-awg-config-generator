@@ -16,7 +16,7 @@ func (b *Bot) startReportScheduler() {
 	go func() {
 		for {
 			now := time.Now()
-			next := time.Date(now.Year(), now.Month(), now.Day(), 22, 0, 0, 0, now.Location())
+			next := time.Date(now.Year(), now.Month(), now.Day(), 19, 0, 0, 0, now.Location())
 			if !next.After(now) {
 				next = next.Add(24 * time.Hour)
 			}
@@ -25,7 +25,7 @@ func (b *Bot) startReportScheduler() {
 			b.sendDailyReport()
 		}
 	}()
-	log.Println("Планировщик отчётов запущен (ежедневно в 22:00)")
+	log.Println("Планировщик отчётов запущен (ежедневно в 19:00)")
 }
 
 // clientTraffic holds traffic info for one client in the report.
@@ -36,18 +36,20 @@ type clientTraffic struct {
 
 func (b *Bot) sendDailyReport() {
 	cfg := b.cfg.Get()
-	if len(cfg.AdminUIDs) == 0 {
-		log.Println("Отчёт: нет admin_uids в конфиге, пропускаю")
-		return
-	}
-
-	var reports []string
 
 	for srvIdx, srv := range cfg.Servers {
+		if len(srv.ReportUIDs) == 0 {
+			continue
+		}
 		peers, err := AWGShowDump(srv)
 		if err != nil {
 			log.Printf("Отчёт: ошибка получения трафика с %s: %v", srv.Name, err)
-			reports = append(reports, fmt.Sprintf("❌ %s: ошибка получения данных", srv.Name))
+			// Send error to server's report recipients
+			errText := fmt.Sprintf("📈 Ежедневный отчёт (%s)\n\n❌ %s: ошибка получения данных",
+				time.Now().Format("02.01.2006"), srv.Name)
+			for _, uid := range srv.ReportUIDs {
+				b.bot.Send(&tele.Chat{ID: uid}, errText)
+			}
 			continue
 		}
 
@@ -102,6 +104,7 @@ func (b *Bot) sendDailyReport() {
 
 		// Build server report
 		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("📈 Ежедневный отчёт (%s)\n\n", time.Now().Format("02.01.2006")))
 		sb.WriteString(fmt.Sprintf("📊 %s\n", srv.Name))
 		sb.WriteString(fmt.Sprintf("Всего за сутки: %s\n", formatBytes(totalBytes)))
 		sb.WriteString(fmt.Sprintf("Клиентов: %d\n", len(clientStats)))
@@ -122,26 +125,20 @@ func (b *Bot) sendDailyReport() {
 			}
 		}
 
-		reports = append(reports, sb.String())
+		// Send to this server's report recipients
+		text := sb.String()
+		for _, uid := range srv.ReportUIDs {
+			_, err := b.bot.Send(&tele.Chat{ID: uid}, text)
+			if err != nil {
+				log.Printf("Отчёт: ошибка отправки %d: %v", uid, err)
+			}
+		}
+		log.Printf("Отчёт по %s отправлен %d получателям", srv.Name, len(srv.ReportUIDs))
 	}
 
 	if err := b.state.Save(); err != nil {
 		log.Printf("Отчёт: ошибка сохранения state: %v", err)
 	}
-
-	// Compose final message
-	header := fmt.Sprintf("📈 Ежедневный отчёт (%s)\n\n", time.Now().Format("02.01.2006"))
-	text := header + strings.Join(reports, "\n\n")
-
-	// Send to all admins
-	for _, uid := range cfg.AdminUIDs {
-		_, err := b.bot.Send(&tele.Chat{ID: uid}, text)
-		if err != nil {
-			log.Printf("Отчёт: ошибка отправки админу %d: %v", uid, err)
-		}
-	}
-
-	log.Printf("Ежедневный отчёт отправлен %d админам", len(cfg.AdminUIDs))
 }
 
 // formatBytes converts bytes to human-readable format.

@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -103,6 +108,7 @@ func ReadServerConfig(srv ServerConfig) (*ServerParams, error) {
 		"Jc": true, "Jmin": true, "Jmax": true,
 		"S1": true, "S2": true, "S3": true, "S4": true,
 		"H1": true, "H2": true, "H3": true, "H4": true,
+		"I1": true, "I2": true, "I3": true, "I4": true, "I5": true,
 	}
 
 	lines := strings.Split(output, "\n")
@@ -184,25 +190,25 @@ func allocateIP(clients []ClientEntry) (string, error) {
 	return "", fmt.Errorf("нет свободных IP-адресов в подсети 10.8.1.0/24")
 }
 
-func AddPeer(srv ServerConfig, name string) (clientConf string, err error) {
+func AddPeer(srv ServerConfig, name string) (clientConf string, vpnURI string, err error) {
 	privKey, pubKey, psk, err := GenerateKeyPair(srv)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	clients, err := ListClients(srv)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	newIP, err := allocateIP(clients)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	srvParams, err := ReadServerConfig(srv)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Append [Peer] block to config via base64 to avoid shell escaping issues
@@ -211,7 +217,7 @@ func AddPeer(srv ServerConfig, name string) (clientConf string, err error) {
 	encoded := base64Encode([]byte(peerBlock))
 	appendCmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d >> %s'", encoded, awgConfPath)
 	if _, err := dockerExec(srv, appendCmd); err != nil {
-		return "", fmt.Errorf("добавление пира в конфиг: %w", err)
+		return "", "", fmt.Errorf("добавление пира в конфиг: %w", err)
 	}
 
 	// Update clientsTable
@@ -229,19 +235,25 @@ func AddPeer(srv ServerConfig, name string) (clientConf string, err error) {
 	clients = append(clients, newEntry)
 
 	if err := writeClientsTable(srv, clients); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Reload interface (bash needed for process substitution)
 	reloadCmd := fmt.Sprintf("bash -c 'awg syncconf %s <(awg-quick strip %s)'", ifaceName, awgConfPath)
 	if _, err := dockerExec(srv, reloadCmd); err != nil {
-		return "", fmt.Errorf("перезагрузка интерфейса: %w", err)
+		return "", "", fmt.Errorf("перезагрузка интерфейса: %w", err)
 	}
 
-	// Build client config
+	// Build client config (AmneziaWG format)
 	clientConf = BuildClientConfig(privKey, psk, newIP, srv.IP, srvParams.ListenPort, srvParams)
 
-	return clientConf, nil
+	// Build AmneziaVPN URI (non-fatal on error)
+	vpnURI, _, vpnErr := BuildAmneziaVPNURI(privKey, pubKey, psk, newIP, srv.IP, srvParams.ListenPort, srv.Name, srvParams)
+	if vpnErr != nil {
+		log.Printf("AmneziaVPN URI build failed: %v", vpnErr)
+	}
+
+	return clientConf, vpnURI, nil
 }
 
 func removePeerBlock(confText, pubKey string) string {
@@ -458,7 +470,7 @@ func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort string, para
 	sb.WriteString("DNS = 1.1.1.1, 1.0.0.1\n")
 
 	// Write AWG params in deterministic order
-	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"} {
+	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"} {
 		if val, ok := params.AWGParams[key]; ok {
 			sb.WriteString(fmt.Sprintf("%s = %s\n", key, val))
 		}
@@ -472,4 +484,204 @@ func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort string, para
 	sb.WriteString("PersistentKeepalive = 25\n")
 
 	return sb.String()
+}
+
+// AmneziaVPN JSON config types
+type amneziaVPNConfig struct {
+	Containers           []amneziaContainer `json:"containers"`
+	DefaultContainer     string             `json:"defaultContainer"`
+	Description          string             `json:"description"`
+	DNS1                 string             `json:"dns1"`
+	DNS2                 string             `json:"dns2"`
+	HostName             string             `json:"hostName"`
+	NameOverriddenByUser bool               `json:"nameOverriddenByUser"`
+}
+
+type amneziaContainer struct {
+	Container string         `json:"container"`
+	AWG       amneziaAWGData `json:"awg"`
+}
+
+type amneziaAWGData struct {
+	Jc              string `json:"Jc,omitempty"`
+	Jmin            string `json:"Jmin,omitempty"`
+	Jmax            string `json:"Jmax,omitempty"`
+	S1              string `json:"S1,omitempty"`
+	S2              string `json:"S2,omitempty"`
+	S3              string `json:"S3,omitempty"`
+	S4              string `json:"S4,omitempty"`
+	H1              string `json:"H1,omitempty"`
+	H2              string `json:"H2,omitempty"`
+	H3              string `json:"H3,omitempty"`
+	H4              string `json:"H4,omitempty"`
+	I1              string `json:"I1"`
+	I2              string `json:"I2"`
+	I3              string `json:"I3"`
+	I4              string `json:"I4"`
+	I5              string `json:"I5"`
+	LastConfig      string `json:"last_config"`
+	Port            string `json:"port"`
+	ProtocolVersion string `json:"protocol_version"`
+	SubnetAddress   string `json:"subnet_address,omitempty"`
+	TransportProto  string `json:"transport_proto"`
+}
+
+// BuildAmneziaVPNURI builds a vpn:// URI for AmneziaVPN app.
+func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, serverName string, params *ServerParams) (vpnURI string, compressedData []byte, err error) {
+	// Determine container type: awg2 if S3/S4 present, otherwise awg
+	containerType := "amnezia-awg"
+	protoVersion := "1"
+	if _, hasS3 := params.AWGParams["S3"]; hasS3 {
+		containerType = "amnezia-awg2"
+		protoVersion = "2"
+		// Ensure I1-I5 exist for v2 (empty string if not set by server)
+		for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+			if _, ok := params.AWGParams[k]; !ok {
+				params.AWGParams[k] = ""
+			}
+		}
+	}
+
+	// Build the full WG+AWG config text
+	confText := BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, params)
+
+	// Parse port as integer for last_config (AmneziaVPN expects number)
+	portNum, _ := strconv.Atoi(serverPort)
+
+	// last_config is a stringified JSON matching AmneziaVPN's internal format
+	lastConfigMap := map[string]interface{}{
+		"config":                confText,
+		"client_priv_key":       privKey,
+		"client_pub_key":        pubKey,
+		"clientId":              pubKey,
+		"server_pub_key":        params.PublicKey,
+		"psk_key":               psk,
+		"client_ip":             clientIP,
+		"hostName":              serverIP,
+		"port":                  portNum,
+		"mtu":                   "1376",
+		"persistent_keep_alive": "25",
+		"allowed_ips":           []string{"0.0.0.0/0", "::/0"},
+	}
+	// Copy ALL AWG params into last_config (including I1-I5 for v2)
+	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"} {
+		if v, ok := params.AWGParams[key]; ok {
+			lastConfigMap[key] = v
+		}
+	}
+	lastConfigBytes, err2 := json.MarshalIndent(lastConfigMap, "", "    ")
+	if err2 != nil {
+		return "", nil, fmt.Errorf("marshal last_config: %w", err2)
+	}
+
+	// Derive subnet from client IP (e.g. 10.8.1.48 → 10.8.1.0)
+	subnetAddr := ""
+	if parts := strings.Split(clientIP, "."); len(parts) == 4 {
+		subnetAddr = parts[0] + "." + parts[1] + "." + parts[2] + ".0"
+	}
+
+	awgData := amneziaAWGData{
+		LastConfig:      string(lastConfigBytes),
+		Port:            serverPort,
+		ProtocolVersion: protoVersion,
+		SubnetAddress:   subnetAddr,
+		TransportProto:  "udp",
+	}
+	// Duplicate AWG params at container level
+	if v, ok := params.AWGParams["Jc"]; ok {
+		awgData.Jc = v
+	}
+	if v, ok := params.AWGParams["Jmin"]; ok {
+		awgData.Jmin = v
+	}
+	if v, ok := params.AWGParams["Jmax"]; ok {
+		awgData.Jmax = v
+	}
+	if v, ok := params.AWGParams["S1"]; ok {
+		awgData.S1 = v
+	}
+	if v, ok := params.AWGParams["S2"]; ok {
+		awgData.S2 = v
+	}
+	if v, ok := params.AWGParams["S3"]; ok {
+		awgData.S3 = v
+	}
+	if v, ok := params.AWGParams["S4"]; ok {
+		awgData.S4 = v
+	}
+	if v, ok := params.AWGParams["H1"]; ok {
+		awgData.H1 = v
+	}
+	if v, ok := params.AWGParams["H2"]; ok {
+		awgData.H2 = v
+	}
+	if v, ok := params.AWGParams["H3"]; ok {
+		awgData.H3 = v
+	}
+	if v, ok := params.AWGParams["H4"]; ok {
+		awgData.H4 = v
+	}
+	if v, ok := params.AWGParams["I1"]; ok {
+		awgData.I1 = v
+	}
+	if v, ok := params.AWGParams["I2"]; ok {
+		awgData.I2 = v
+	}
+	if v, ok := params.AWGParams["I3"]; ok {
+		awgData.I3 = v
+	}
+	if v, ok := params.AWGParams["I4"]; ok {
+		awgData.I4 = v
+	}
+	if v, ok := params.AWGParams["I5"]; ok {
+		awgData.I5 = v
+	}
+
+	cfg := amneziaVPNConfig{
+		Containers: []amneziaContainer{
+			{
+				Container: containerType,
+				AWG:       awgData,
+			},
+		},
+		DefaultContainer:     containerType,
+		Description:          serverName,
+		DNS1:                 "1.1.1.1",
+		DNS2:                 "1.0.0.1",
+		HostName:             serverIP,
+		NameOverriddenByUser: true,
+	}
+
+	jsonBytes, err := json.MarshalIndent(cfg, "", "    ")
+	if err != nil {
+		return "", nil, fmt.Errorf("marshal AmneziaVPN config: %w", err)
+	}
+
+	// Compress with zlib (Qt qCompress format: 4-byte big-endian uncompressed size + zlib data)
+	var zlibBuf bytes.Buffer
+	w := zlib.NewWriter(&zlibBuf)
+	if _, err := w.Write(jsonBytes); err != nil {
+		return "", nil, fmt.Errorf("zlib compress: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return "", nil, fmt.Errorf("zlib close: %w", err)
+	}
+
+	// Prepend Qt 4-byte header (uncompressed size, big-endian)
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, uint32(len(jsonBytes))); err != nil {
+		return "", nil, fmt.Errorf("write qt header: %w", err)
+	}
+	buf.Write(zlibBuf.Bytes())
+
+	compressed := buf.Bytes()
+
+	// Encode as base64url (no padding) for vpn:// URI
+	uri := "vpn://" + base64.RawURLEncoding.EncodeToString(compressed)
+
+	// Debug: write files
+	os.WriteFile("amneziavpn_raw.json", jsonBytes, 0644)
+	os.WriteFile("amneziavpn_uri.txt", []byte(uri), 0644)
+
+	return uri, compressed, nil
 }
