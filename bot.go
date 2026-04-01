@@ -161,7 +161,7 @@ func (b *Bot) editOrSend(s *UserSession, bot *tele.Bot, text string, markup *tel
 		} else {
 			_, err = bot.Edit(msg, text)
 		}
-		if err == nil {
+		if err == nil || strings.Contains(err.Error(), "message is not modified") {
 			return nil
 		}
 		log.Printf("Edit failed (msg %d): %v", s.MessageID, err)
@@ -809,16 +809,22 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 			File:     tele.FromReader(bytes.NewReader(awgPNG)),
 			FileName: "qr_amneziawg.png",
 		}
-		_ = c.SendAlbum(tele.Album{confDoc, qrDoc})
+		if err := c.SendAlbum(tele.Album{confDoc, qrDoc}); err != nil {
+			log.Printf("SendAlbum failed: %v", err)
+		}
 	} else {
-		_ = c.Send(confDoc)
+		if err := c.Send(confDoc); err != nil {
+			log.Printf("Send conf failed: %v", err)
+		}
 	}
 
 	// Send AmneziaVPN key as text message
-	if vpnURI != "" {
+	if vpnURI == "" {
+		log.Printf("vpnURI is empty, skipping AmneziaVPN key message")
+	} else {
 		vpnText := "📱 Ключ для AmneziaVPN\n\n" +
 			"Скопируйте ключ (нажмите на него) → откройте AmneziaVPN → «+» → «Вставить ключ из буфера обмена».\n\n" +
-			"<blockquote expandable><code>" + vpnURI + "</code></blockquote>"
+			"<code>" + vpnURI + "</code>"
 		_, err := c.Bot().Send(&tele.Chat{ID: c.Sender().ID}, vpnText, &tele.SendOptions{
 			ParseMode:             tele.ModeHTML,
 			DisableWebPagePreview: true,

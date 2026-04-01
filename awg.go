@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"strconv"
 	"strings"
 )
@@ -71,6 +70,18 @@ func writeClientsTable(srv ServerConfig, clients []ClientEntry) error {
 func dockerExec(srv ServerConfig, cmd string) (string, error) {
 	full := fmt.Sprintf("docker exec %s %s", containerName, cmd)
 	return SSHRun(srv, full)
+}
+
+func GetAmneziaDNSIP(srv ServerConfig) string {
+	out, err := SSHRun(srv, `docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' amnezia-dns`)
+	if err != nil {
+		return ""
+	}
+	ip := strings.TrimSpace(out)
+	if ip == "" || strings.Contains(ip, "Error") {
+		return ""
+	}
+	return ip
 }
 
 func ListClients(srv ServerConfig) ([]ClientEntry, error) {
@@ -211,6 +222,11 @@ func AddPeer(srv ServerConfig, name string) (clientConf string, vpnURI string, e
 		return "", "", err
 	}
 
+	dns1, dns2 := "8.8.8.8", "8.8.4.4"
+	if dnsIP := GetAmneziaDNSIP(srv); dnsIP != "" {
+		dns1 = dnsIP
+	}
+
 	// Append [Peer] block to config via base64 to avoid shell escaping issues
 	peerBlock := fmt.Sprintf("\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n", pubKey, psk, newIP)
 
@@ -245,10 +261,10 @@ func AddPeer(srv ServerConfig, name string) (clientConf string, vpnURI string, e
 	}
 
 	// Build client config (AmneziaWG format)
-	clientConf = BuildClientConfig(privKey, psk, newIP, srv.IP, srvParams.ListenPort, srvParams)
+	clientConf = BuildClientConfig(privKey, psk, newIP, srv.IP, srvParams.ListenPort, dns1, dns2, srvParams)
 
 	// Build AmneziaVPN URI (non-fatal on error)
-	vpnURI, _, vpnErr := BuildAmneziaVPNURI(privKey, pubKey, psk, newIP, srv.IP, srvParams.ListenPort, srv.Name, srvParams)
+	vpnURI, _, vpnErr := BuildAmneziaVPNURI(privKey, pubKey, psk, newIP, srv.IP, srvParams.ListenPort, srv.Name, dns1, dns2, srvParams)
 	if vpnErr != nil {
 		log.Printf("AmneziaVPN URI build failed: %v", vpnErr)
 	}
@@ -462,12 +478,12 @@ func RenamePeer(srv ServerConfig, pubKey, newName string) error {
 	return writeClientsTable(srv, clients)
 }
 
-func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort string, params *ServerParams) string {
+func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2 string, params *ServerParams) string {
 	var sb strings.Builder
 	sb.WriteString("[Interface]\n")
 	sb.WriteString(fmt.Sprintf("PrivateKey = %s\n", privKey))
 	sb.WriteString(fmt.Sprintf("Address = %s/32\n", clientIP))
-	sb.WriteString("DNS = 1.1.1.1, 1.0.0.1\n")
+	sb.WriteString(fmt.Sprintf("DNS = %s, %s\n", dns1, dns2))
 
 	// Write AWG params in deterministic order
 	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"} {
@@ -527,7 +543,7 @@ type amneziaAWGData struct {
 }
 
 // BuildAmneziaVPNURI builds a vpn:// URI for AmneziaVPN app.
-func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, serverName string, params *ServerParams) (vpnURI string, compressedData []byte, err error) {
+func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, serverName, dns1, dns2 string, params *ServerParams) (vpnURI string, compressedData []byte, err error) {
 	// Determine container type: awg2 if S3/S4 present, otherwise awg
 	containerType := "amnezia-awg"
 	protoVersion := "1"
@@ -543,7 +559,7 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 	}
 
 	// Build the full WG+AWG config text
-	confText := BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, params)
+	confText := BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2, params)
 
 	// Parse port as integer for last_config (AmneziaVPN expects number)
 	portNum, _ := strconv.Atoi(serverPort)
@@ -646,8 +662,8 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 		},
 		DefaultContainer:     containerType,
 		Description:          serverName,
-		DNS1:                 "1.1.1.1",
-		DNS2:                 "1.0.0.1",
+		DNS1:                 dns1,
+		DNS2:                 dns2,
 		HostName:             serverIP,
 		NameOverriddenByUser: true,
 	}
@@ -678,10 +694,6 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 
 	// Encode as base64url (no padding) for vpn:// URI
 	uri := "vpn://" + base64.RawURLEncoding.EncodeToString(compressed)
-
-	// Debug: write files
-	os.WriteFile("amneziavpn_raw.json", jsonBytes, 0644)
-	os.WriteFile("amneziavpn_uri.txt", []byte(uri), 0644)
 
 	return uri, compressed, nil
 }

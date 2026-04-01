@@ -103,13 +103,13 @@ func TestBuildClientConfig(t *testing.T) {
 		},
 	}
 
-	conf := BuildClientConfig("clientPrivKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", params)
+	conf := BuildClientConfig("clientPrivKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", params)
 
 	mustContain := []string{
 		"[Interface]",
 		"PrivateKey = clientPrivKey=",
 		"Address = 10.8.1.5/32",
-		"DNS = 1.1.1.1",
+		"DNS = 8.8.8.8",
 		"Jc = 4",
 		"Jmin = 40",
 		"Jmax = 70",
@@ -154,7 +154,7 @@ func TestBuildAmneziaVPNURI(t *testing.T) {
 		},
 	}
 
-	uri, _, err := BuildAmneziaVPNURI("clientPrivKey=", "clientPubKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", "TestServer", params)
+	uri, _, err := BuildAmneziaVPNURI("clientPrivKey=", "clientPubKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", "TestServer", "8.8.8.8", "8.8.4.4", params)
 	if err != nil {
 		t.Fatalf("BuildAmneziaVPNURI failed: %v", err)
 	}
@@ -196,8 +196,8 @@ func TestBuildAmneziaVPNURI(t *testing.T) {
 	if cfg.HostName != "1.2.3.4" {
 		t.Errorf("expected hostName=1.2.3.4, got %s", cfg.HostName)
 	}
-	if cfg.DNS1 != "1.1.1.1" {
-		t.Errorf("expected dns1=1.1.1.1, got %s", cfg.DNS1)
+	if cfg.DNS1 != "8.8.8.8" {
+		t.Errorf("expected dns1=8.8.8.8, got %s", cfg.DNS1)
 	}
 	if cfg.DefaultContainer != "amnezia-awg" {
 		t.Errorf("expected defaultContainer=amnezia-awg, got %s", cfg.DefaultContainer)

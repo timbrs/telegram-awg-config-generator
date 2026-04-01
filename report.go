@@ -37,6 +37,9 @@ type clientTraffic struct {
 func (b *Bot) sendDailyReport() {
 	cfg := b.cfg.Get()
 
+	// Collect report blocks per recipient: uid -> list of text blocks
+	perUser := make(map[int64][]string)
+
 	for srvIdx, srv := range cfg.Servers {
 		if len(srv.ReportUIDs) == 0 {
 			continue
@@ -44,11 +47,9 @@ func (b *Bot) sendDailyReport() {
 		peers, err := AWGShowDump(srv)
 		if err != nil {
 			log.Printf("Отчёт: ошибка получения трафика с %s: %v", srv.Name, err)
-			// Send error to server's report recipients
-			errText := fmt.Sprintf("📈 Ежедневный отчёт (%s)\n\n❌ %s: ошибка получения данных",
-				time.Now().Format("02.01.2006"), srv.Name)
+			errBlock := fmt.Sprintf("❌ %s: ошибка получения данных", srv.Name)
 			for _, uid := range srv.ReportUIDs {
-				b.bot.Send(&tele.Chat{ID: uid}, errText)
+				perUser[uid] = append(perUser[uid], errBlock)
 			}
 			continue
 		}
@@ -102,9 +103,8 @@ func (b *Bot) sendDailyReport() {
 			Peers: currentSnap,
 		})
 
-		// Build server report
+		// Build server report block
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("📈 Ежедневный отчёт (%s)\n\n", time.Now().Format("02.01.2006")))
 		sb.WriteString(fmt.Sprintf("📊 %s\n", srv.Name))
 		sb.WriteString(fmt.Sprintf("Всего за сутки: %s\n", formatBytes(totalBytes)))
 		sb.WriteString(fmt.Sprintf("Клиентов: %d\n", len(clientStats)))
@@ -125,16 +125,21 @@ func (b *Bot) sendDailyReport() {
 			}
 		}
 
-		// Send to this server's report recipients
-		text := sb.String()
+		block := sb.String()
 		for _, uid := range srv.ReportUIDs {
-			_, err := b.bot.Send(&tele.Chat{ID: uid}, text)
-			if err != nil {
-				log.Printf("Отчёт: ошибка отправки %d: %v", uid, err)
-			}
+			perUser[uid] = append(perUser[uid], block)
 		}
-		log.Printf("Отчёт по %s отправлен %d получателям", srv.Name, len(srv.ReportUIDs))
 	}
+
+	// Send one combined message per recipient
+	date := time.Now().Format("02.01.2006")
+	for uid, blocks := range perUser {
+		text := fmt.Sprintf("📈 Ежедневный отчёт (%s)\n\n%s", date, strings.Join(blocks, "\n"))
+		if _, err := b.bot.Send(&tele.Chat{ID: uid}, text); err != nil {
+			log.Printf("Отчёт: ошибка отправки %d: %v", uid, err)
+		}
+	}
+	log.Printf("Отчёт отправлен %d получателям", len(perUser))
 
 	if err := b.state.Save(); err != nil {
 		log.Printf("Отчёт: ошибка сохранения state: %v", err)
