@@ -219,13 +219,13 @@ func diagnoseServer(srv ServerConfig, log *InstallLog) (*ServerDiag, error) {
 func generateAWGParams() map[string]string {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return map[string]string{
-		"Jc":   fmt.Sprintf("%d", 3+r.Intn(6)),          // 3-8
-		"Jmin": fmt.Sprintf("%d", 40+r.Intn(41)),         // 40-80
-		"Jmax": fmt.Sprintf("%d", 80+r.Intn(41)),         // 80-120
-		"S1":   fmt.Sprintf("%d", 15+r.Intn(136)),         // 15-150
-		"S2":   fmt.Sprintf("%d", 15+r.Intn(136)),         // 15-150
-		"S3":   fmt.Sprintf("%d", 15+r.Intn(136)),         // 15-150 (handshake only)
-		"S4":   fmt.Sprintf("%d", 4+r.Intn(9)),            // 4-12 (data packets, MUST fit in MTU)
+		"Jc":   fmt.Sprintf("%d", 3+r.Intn(6)),    // 3-8
+		"Jmin": fmt.Sprintf("%d", 40+r.Intn(41)),  // 40-80
+		"Jmax": fmt.Sprintf("%d", 80+r.Intn(41)),  // 80-120
+		"S1":   fmt.Sprintf("%d", 15+r.Intn(136)), // 15-150
+		"S2":   fmt.Sprintf("%d", 15+r.Intn(136)), // 15-150
+		"S3":   fmt.Sprintf("%d", 15+r.Intn(136)), // 15-150 (handshake only)
+		"S4":   fmt.Sprintf("%d", 4+r.Intn(9)),    // 4-12 (data packets, MUST fit in MTU)
 		"H1":   fmt.Sprintf("%d", r.Uint32()),
 		"H2":   fmt.Sprintf("%d", r.Uint32()),
 		"H3":   fmt.Sprintf("%d", r.Uint32()),
@@ -233,7 +233,9 @@ func generateAWGParams() map[string]string {
 	}
 }
 
-func buildServerConf(privKey string, port int, netIface string, awgParams map[string]string, ipv6IfaceAddr, ipv6ClientSubnet string) string {
+// buildServerConf собирает awg0.conf для установки с нуля. v — версия протокола
+// на сервере: параметры, которых в ней нет, в конфиг не попадают.
+func buildServerConf(privKey string, port int, netIface string, awgParams map[string]string, ipv6IfaceAddr, ipv6ClientSubnet string, v AWGVersion) string {
 	var sb strings.Builder
 	sb.WriteString("[Interface]\n")
 	sb.WriteString(fmt.Sprintf("PrivateKey = %s\n", privKey))
@@ -245,8 +247,8 @@ func buildServerConf(privKey string, port int, netIface string, awgParams map[st
 	sb.WriteString(fmt.Sprintf("Address = %s\n", addr))
 	sb.WriteString(fmt.Sprintf("ListenPort = %d\n", port))
 
-	// AWG params
-	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"} {
+	// AWG params — только те, что понимает версия v на сервере.
+	for _, key := range serverParamOrder(v) {
 		if val, ok := awgParams[key]; ok {
 			sb.WriteString(fmt.Sprintf("%s = %s\n", key, val))
 		}
@@ -260,7 +262,7 @@ func buildServerConf(privKey string, port int, netIface string, awgParams map[st
 	if ipv6IfaceAddr != "" {
 		postUp += "; sysctl -q -w net.ipv6.conf.all.forwarding=1"
 		postUp += fmt.Sprintf(
-			"; ip6tables -C FORWARD -i %%i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i %%i -j ACCEPT"+
+			"; ip6tables -C FORWARD -i %%i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i %%i -j ACCEPT" +
 				"; ip6tables -C FORWARD -o %%i -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -o %%i -j ACCEPT")
 		// Add explicit route for client subnet if it differs from iface addr (the /64 case)
 		if ipv6ClientSubnet != "" && ipv6ClientSubnet != ipv6IfaceAddr {
@@ -312,15 +314,15 @@ func calculateVPNv6Subnet(serverIPv6 string, prefixLen int) (ifaceAddr, clientSu
 		// Use prefix:0001::1/112 — separate /64, no overlap with eth0
 		result := make(net.IP, 16)
 		copy(result, ip16[:6]) // copy first 48 bits
-		result[7] = 1         // set subnet ID to 1 in bytes 6-7 (bits 48-63)
-		result[15] = 1        // ::1
+		result[7] = 1          // set subnet ID to 1 in bytes 6-7 (bits 48-63)
+		result[15] = 1         // ::1
 		subnet := fmt.Sprintf("%s/112", result)
 		return subnet, subnet, result.String()
 
 	case prefixLen <= 56:
 		// Use prefix + next /64 subnet — separate /64, no overlap
 		result := make(net.IP, 16)
-		copy(result, ip16[:7]) // copy first 56 bits
+		copy(result, ip16[:7])  // copy first 56 bits
 		result[7] = ip16[7] + 1 // next subnet
 		result[15] = 1          // ::1
 		subnet := fmt.Sprintf("%s/112", result)
@@ -335,7 +337,7 @@ func calculateVPNv6Subnet(serverIPv6 string, prefixLen int) (ifaceAddr, clientSu
 		// Requires explicit route + ndppd because it's within the same /64 as eth0.
 		srvResult := make(net.IP, 16)
 		copy(srvResult, ip16[:8]) // copy the /64 prefix
-		srvResult[15] = 1        // ::1
+		srvResult[15] = 1         // ::1
 		ifAddr := fmt.Sprintf("%s/64", srvResult)
 
 		// Client subnet template: prefix::/96 covers all /112 sub-subnets
@@ -488,9 +490,11 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 		cfgIfaceAddr = ipv6IfaceAddr
 		cfgClientSubnet = ipv6ClientSubnet
 	}
-	confContent := buildServerConf(serverPrivKey, port, diag.NetIface, awgParams, cfgIfaceAddr, cfgClientSubnet)
+	// generateAWGParams выдаёт набор AWG 2.0; HeaderProtectionKey и прочие
+	// параметры 3.0 бот сам не генерирует (см. CLAUDE.md).
+	confContent := buildServerConf(serverPrivKey, port, diag.NetIface, awgParams, cfgIfaceAddr, cfgClientSubnet, AWGVersion2)
 	confB64 := base64.StdEncoding.EncodeToString([]byte(confContent))
-	confWriteCmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d > %s/%s.conf'", confB64, defaultNativeDir, ifaceName)
+	confWriteCmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d > %s/%s.conf'", confB64, defaultNativeDir, defaultIfaceName)
 	_, err = runInstallStep(log, srv, "Write awg0.conf", confWriteCmd, 10*time.Second)
 	if err != nil {
 		log.FinalStatus = "failed"
@@ -526,7 +530,7 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 
 			// Enable and start ndppd, configure systemd ordering
 			ndppdSetup := "systemctl enable ndppd 2>/dev/null; " +
-				fmt.Sprintf("mkdir -p /etc/systemd/system/ndppd.service.d && printf '[Unit]\\nAfter=awg-quick@%s.service\\nWants=awg-quick@%s.service\\n' > /etc/systemd/system/ndppd.service.d/after-awg.conf && systemctl daemon-reload", ifaceName, ifaceName)
+				fmt.Sprintf("mkdir -p /etc/systemd/system/ndppd.service.d && printf '[Unit]\\nAfter=awg-quick@%s.service\\nWants=awg-quick@%s.service\\n' > /etc/systemd/system/ndppd.service.d/after-awg.conf && systemctl daemon-reload", defaultIfaceName, defaultIfaceName)
 			_, _ = runInstallStep(log, srv, "Configure ndppd systemd", ndppdSetup, 15*time.Second)
 		}
 	}
@@ -535,7 +539,7 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 	startStep := totalSteps - 1
 	progressFn(fmt.Sprintf("Шаг %d/%d: Запуск сервиса...", startStep, totalSteps))
 	_, err = runInstallStep(log, srv, "Start AWG service",
-		"systemctl enable --now awg-quick@awg0", 30*time.Second)
+		fmt.Sprintf("systemctl enable --now awg-quick@%s", defaultIfaceName), 30*time.Second)
 	if err != nil {
 		log.FinalStatus = "failed"
 		log.FinishedAt = time.Now()
@@ -550,7 +554,7 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 	// Last step: Verify
 	progressFn(fmt.Sprintf("Шаг %d/%d: Верификация...", totalSteps, totalSteps))
 	_, err = runInstallStep(log, srv, "Verify AWG",
-		fmt.Sprintf("awg show %s", ifaceName), 10*time.Second)
+		fmt.Sprintf("awg show %s", defaultIfaceName), 10*time.Second)
 	if err != nil {
 		log.FinalStatus = "failed"
 		log.FinishedAt = time.Now()
@@ -571,7 +575,7 @@ func RollbackAWGInstall(srv ServerConfig, log *InstallLog) {
 	}
 
 	actions := []rollbackAction{
-		{"Start AWG service", "systemctl disable --now awg-quick@awg0 2>/dev/null"},
+		{"Start AWG service", fmt.Sprintf("systemctl disable --now awg-quick@%s 2>/dev/null", defaultIfaceName)},
 		{"Create config directory", fmt.Sprintf("rm -rf %s", defaultNativeDir)},
 		{"Enable IP forwarding", "rm -f /etc/sysctl.d/99-awg.conf; sysctl --system 2>/dev/null"},
 		{"Install AWG packages", "DEBIAN_FRONTEND=noninteractive apt-get remove -y amneziawg amneziawg-tools 2>/dev/null"},

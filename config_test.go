@@ -2,8 +2,112 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+// saveLocked перезаписывает весь YAML при любом изменении, поэтому новые поля
+// обязаны быть omitempty: иначе в записи живых серверов насыплется awg_version: 0.
+func TestServerConfigYAMLOmitEmpty(t *testing.T) {
+	cfg := AppConfig{
+		BotToken: "t",
+		Servers: []ServerConfig{{
+			Name: "srv1", IP: "1.2.3.4", Login: "root", Pass: "p",
+			AllowedUIDs: []int64{111},
+		}},
+	}
+
+	data, err := yaml.Marshal(&cfg)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	out := string(data)
+
+	for _, key := range []string{"iface:", "awg_version:", "awg_tools_version:", "dns:", "mode:", "awg_conf_dir:"} {
+		if strings.Contains(out, key) {
+			t.Errorf("пустое поле %q не должно попадать в YAML:\n%s", key, out)
+		}
+	}
+}
+
+func TestServerConfigYAMLRoundTrip(t *testing.T) {
+	orig := AppConfig{
+		BotToken: "t",
+		Servers: []ServerConfig{{
+			Name: "srv1", IP: "1.2.3.4", Login: "root", Pass: "p",
+			AllowedUIDs: []int64{111},
+			Mode:        "native",
+			Iface:       "wg0",
+			AWGVersion:  int(AWGVersion3),
+			AWGToolsVer: "3.0.20260730",
+			DNS:         "1.1.1.1, 1.0.0.1",
+		}},
+	}
+
+	data, err := yaml.Marshal(&orig)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var back AppConfig
+	if err := yaml.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	got := back.Servers[0]
+	if got.Iface != "wg0" || got.IfaceName() != "wg0" {
+		t.Errorf("Iface не пережил round-trip: %q", got.Iface)
+	}
+	if got.ProtoVersion() != AWGVersion3 {
+		t.Errorf("AWGVersion не пережил round-trip: %v", got.ProtoVersion())
+	}
+	if got.AWGToolsVer != "3.0.20260730" {
+		t.Errorf("AWGToolsVer не пережил round-trip: %q", got.AWGToolsVer)
+	}
+	if got.DNS != "1.1.1.1, 1.0.0.1" {
+		t.Errorf("DNS не пережил round-trip: %q", got.DNS)
+	}
+}
+
+// SetAWGInfo пишет версию и интерфейс в config.yaml; дефолтный awg0 не пишется.
+func TestSetAWGInfo(t *testing.T) {
+	tmp, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	tmp.WriteString("bot_token: \"t\"\nservers:\n  - name: \"s1\"\n    ip: \"1.1.1.1\"\n    login: \"r\"\n    pass: \"p\"\n    allowed_uids: [111]\n")
+	tmp.Close()
+
+	cm := NewConfigManager(tmp.Name())
+	if err := cm.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	info := AWGVersionInfo{Version: AWGVersion3, ToolsRaw: "3.0.20260730", KmodRaw: "3.0.20260731-04"}
+	if err := cm.SetAWGInfo(0, info, "wg0"); err != nil {
+		t.Fatalf("SetAWGInfo failed: %v", err)
+	}
+
+	srv := cm.Get().Servers[0]
+	if srv.ProtoVersion() != AWGVersion3 || srv.Iface != "wg0" || srv.AWGToolsVer != "3.0.20260730" {
+		t.Errorf("SetAWGInfo не сохранил данные: %+v", srv)
+	}
+
+	// Дефолтный интерфейс не должен попадать в YAML.
+	if err := cm.SetAWGInfo(0, info, defaultIfaceName); err != nil {
+		t.Fatalf("SetAWGInfo failed: %v", err)
+	}
+	if got := cm.Get().Servers[0]; got.Iface != "" || got.IfaceName() != defaultIfaceName {
+		t.Errorf("awg0 должен сбрасывать iface в пустую строку, получено %q", got.Iface)
+	}
+
+	if err := cm.SetAWGInfo(99, info, ""); err == nil {
+		t.Error("индекс вне диапазона должен давать ошибку")
+	}
+}
 
 func TestConfigLoad(t *testing.T) {
 	yaml := `bot_token: "test-token"

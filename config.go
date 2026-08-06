@@ -18,12 +18,16 @@ type ServerConfig struct {
 	AllowedUIDs   []int64   `yaml:"allowed_uids"`
 	ReportUIDs    []int64   `yaml:"report_uids"`
 	LastConnected time.Time `yaml:"last_connected"`
-	Mode          string    `yaml:"mode,omitempty"`         // "docker" (default) or "native"
-	AWGConfDir    string    `yaml:"awg_conf_dir,omitempty"` // path to AWG configs
-	Port          int       `yaml:"port,omitempty"`         // AWG listen port (default 51820)
-	NetIface      string    `yaml:"net_iface,omitempty"`    // main network interface (eth0)
-	IPv6Subnet    string    `yaml:"ipv6_subnet,omitempty"`  // VPN IPv6 client subnet CIDR (e.g. 2a01:db8::4000/114)
-	IPv6IfaceAddr string    `yaml:"ipv6_iface_addr,omitempty"` // AWG interface IPv6 address (e.g. 2a01:db8::1/64), empty = same as IPv6Subnet
+	Mode          string    `yaml:"mode,omitempty"`              // "docker" (default) or "native"
+	AWGConfDir    string    `yaml:"awg_conf_dir,omitempty"`      // path to AWG configs
+	Port          int       `yaml:"port,omitempty"`              // AWG listen port (default 51820)
+	NetIface      string    `yaml:"net_iface,omitempty"`         // main network interface (eth0)
+	IPv6Subnet    string    `yaml:"ipv6_subnet,omitempty"`       // VPN IPv6 client subnet CIDR (e.g. 2a01:db8::4000/114)
+	IPv6IfaceAddr string    `yaml:"ipv6_iface_addr,omitempty"`   // AWG interface IPv6 address (e.g. 2a01:db8::1/64), empty = same as IPv6Subnet
+	Iface         string    `yaml:"iface,omitempty"`             // имя AWG-интерфейса, awg0 по умолчанию
+	AWGVersion    int       `yaml:"awg_version,omitempty"`       // 1/15/2/3 — кэш детекта версии протокола
+	AWGToolsVer   string    `yaml:"awg_tools_version,omitempty"` // "3.0.20260730" — для показа в UI
+	DNS           string    `yaml:"dns,omitempty"`               // DNS для клиентских конфигов (через запятую)
 }
 
 type AppConfig struct {
@@ -39,6 +43,20 @@ func (s ServerConfig) EndpointHost() string {
 		return s.EndpointIP
 	}
 	return s.IP
+}
+
+// IfaceName — имя AWG-интерфейса; awg0 по умолчанию (так называет его Amnezia).
+// На сервере, настроенном вручную, интерфейс вполне может называться wg0.
+func (s ServerConfig) IfaceName() string {
+	if s.Iface != "" {
+		return s.Iface
+	}
+	return defaultIfaceName
+}
+
+// ProtoVersion — закэшированная версия протокола AWG на сервере.
+func (s ServerConfig) ProtoVersion() AWGVersion {
+	return AWGVersion(s.AWGVersion)
 }
 
 type ConfigManager struct {
@@ -121,6 +139,28 @@ func (cm *ConfigManager) RenameServer(serverIdx int, newName string) error {
 	}
 
 	cm.config.Servers[serverIdx].Name = newName
+	return cm.saveLocked()
+}
+
+// SetAWGInfo сохраняет результат детекта версии и имени интерфейса.
+// Кэш нужен потому, что версия на сервере меняется независимо от бота
+// (apt upgrade), а на горячем пути (AddPeer, showStatus) SSH-детект не делается.
+func (cm *ConfigManager) SetAWGInfo(serverIdx int, info AWGVersionInfo, iface string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if serverIdx < 0 || serverIdx >= len(cm.config.Servers) {
+		return fmt.Errorf("индекс сервера %d вне диапазона", serverIdx)
+	}
+
+	srv := &cm.config.Servers[serverIdx]
+	srv.AWGVersion = int(info.Version)
+	srv.AWGToolsVer = info.ToolsRaw
+	if iface == defaultIfaceName {
+		srv.Iface = "" // дефолт в YAML не пишем
+	} else if iface != "" {
+		srv.Iface = iface
+	}
 	return cm.saveLocked()
 }
 

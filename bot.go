@@ -51,20 +51,22 @@ type UserSession struct {
 	PendingUserMsgIDs []int  // user message IDs to delete after rename
 	Page              int    // current page for paginated lists (0-based)
 	// Add-server flow
-	PendingServerIP    string // IP for new server
-	PendingServerLogin string // login for new server
-	PendingServerPass  string // password for new server
-	PendingServerMode  string // detected mode ("docker"/"native")
-	PendingServerDir   string // detected AWG config dir
+	PendingServerIP    string         // IP for new server
+	PendingServerLogin string         // login for new server
+	PendingServerPass  string         // password for new server
+	PendingServerMode  string         // detected mode ("docker"/"native")
+	PendingServerDir   string         // detected AWG config dir
+	PendingServerIface string         // detected AWG interface name
+	PendingServerVer   AWGVersionInfo // detected AWG version
 	// Admin management
 	PendingAdminServerIdx int   // server index for admin management
 	PendingAdminUID       int64 // UID of selected admin for editing
 	// Install AWG flow
-	PendingInstallPort  int    // AWG listen port
-	PendingInstallIPv6  bool   // enable IPv6 for VPN
-	PendingIPv6Subnet   string // computed VPN IPv6 client subnet CIDR
+	PendingInstallPort   int    // AWG listen port
+	PendingInstallIPv6   bool   // enable IPv6 for VPN
+	PendingIPv6Subnet    string // computed VPN IPv6 client subnet CIDR
 	PendingIPv6IfaceAddr string // computed AWG interface IPv6 address
-	PendingNetIface     string // detected network interface
+	PendingNetIface      string // detected network interface
 }
 
 const clientsPerPage = 30
@@ -81,6 +83,7 @@ var (
 	btnServerSel    = tele.InlineButton{Unique: "sv"}
 	btnServerRename = tele.InlineButton{Unique: "svrn"}
 	btnServerRenSel = tele.InlineButton{Unique: "svr"}
+	btnServerVer    = tele.InlineButton{Unique: "svv"}
 	btnPagePrev     = tele.InlineButton{Unique: "ppv"}
 	btnPageNext     = tele.InlineButton{Unique: "pnx"}
 	btnNoop         = tele.InlineButton{Unique: "noop"}
@@ -177,6 +180,7 @@ func (b *Bot) Start() {
 	b.bot.Handle(&btnServerSel, b.cbServerSelect)
 	b.bot.Handle(&btnServerRename, b.cbServerRename)
 	b.bot.Handle(&btnServerRenSel, b.cbServerRenameSelect)
+	b.bot.Handle(&btnServerVer, b.cbRefreshVersion)
 	b.bot.Handle(&btnPagePrev, b.cbPagePrev)
 	b.bot.Handle(&btnPageNext, b.cbPageNext)
 	b.bot.Handle(&btnNoop, func(c tele.Context) error { return c.Respond() })
@@ -427,7 +431,8 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig, uid in
 	super := isSuperAdmin(uid, srv)
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📋 Сервер: %s (всего: %d)\n\n", srv.Name, len(clients)))
+	sb.WriteString(fmt.Sprintf("📋 Сервер: %s (всего: %d)\n", srv.Name, len(clients)))
+	sb.WriteString(serverInfoLine(srv) + "\n\n")
 
 	if len(clients) == 0 {
 		sb.WriteString("Клиенты не найдены.")
@@ -576,7 +581,7 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 	} else {
 		for i, idx := range indices {
 			srv := cfg.Servers[idx]
-			text := fmt.Sprintf("%s (%s)", srv.Name, srv.IP)
+			text := fmt.Sprintf("%s (%s)%s", srv.Name, srv.IP, versionBadge(srv))
 			if hasActive && idx == activeIdx {
 				text += " ✅"
 			}
@@ -589,10 +594,105 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 		markup.Data("👥 Админы", btnAdminList.Unique),
 		markup.Data("✏️ Переименовать", btnServerRename.Unique),
 	})
+	rows = append(rows, tele.Row{markup.Data("🔄 Обновить версию", btnServerVer.Unique)})
 	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
 	markup.Inline(rows...)
 
 	return b.editOrSend(s, bot, "🖥 Управление серверами:", markup)
+}
+
+// serverInfoLine — строка «⚙️ Native · AWG 3.0 · awg0» для шапки статуса.
+// Данные берутся из кэша в config.yaml, без SSH: на горячем пути детект не нужен.
+func serverInfoLine(srv ServerConfig) string {
+	parts := []string{modeLabel(srv.Mode)}
+	if v := srv.ProtoVersion(); v != AWGVersionUnknown {
+		parts = append(parts, v.String())
+	}
+	parts = append(parts, srv.IfaceName())
+	return "⚙️ " + strings.Join(parts, " · ")
+}
+
+// versionBadge — короткий бейдж версии для подписи кнопки сервера.
+func versionBadge(srv ServerConfig) string {
+	if v := srv.ProtoVersion(); v != AWGVersionUnknown {
+		return " · " + v.String()
+	}
+	return ""
+}
+
+func modeLabel(mode string) string {
+	if mode == "native" {
+		return "Native"
+	}
+	return "Docker"
+}
+
+// versionLabel — «AWG 3.0 (tools 3.0.20260730)» для экрана добавления сервера.
+func versionLabel(info AWGVersionInfo) string {
+	if info.Version == AWGVersionUnknown {
+		return "не определена"
+	}
+	label := info.Version.String()
+	if info.ToolsRaw != "" {
+		label += " (tools " + info.ToolsRaw + ")"
+	}
+	return label
+}
+
+// cbRefreshVersion перезапрашивает версию AWG на всех доступных пользователю
+// серверах. Кнопка живёт на экране списка серверов, поэтому обновляет весь
+// список; нужна потому, что версия на сервере меняется независимо от бота
+// (apt upgrade).
+func (b *Bot) cbRefreshVersion(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	indices := b.cfg.ServersForUser(uid)
+	if len(indices) == 0 {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
+	}
+
+	_ = b.editOrSend(s, c.Bot(), "⏳ Опрашиваю серверы...", nil)
+
+	var failed []string
+	for _, idx := range indices {
+		srv := b.cfg.Get().Servers[idx]
+		info, err := detectAWGVersion(srv)
+		if err != nil {
+			log.Printf("детект версии AWG (%s): %v", srv.Name, err)
+			failed = append(failed, srv.Name)
+			continue
+		}
+		if err := b.cfg.SetAWGInfo(idx, info, refreshedIface(srv)); err != nil {
+			log.Printf("сохранение версии AWG (%s): %v", srv.Name, err)
+			failed = append(failed, srv.Name)
+		}
+	}
+
+	if len(failed) > 0 {
+		markup := &tele.ReplyMarkup{}
+		markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+		text := "⚠️ Не удалось определить версию AWG: " + strings.Join(failed, ", ")
+		return b.editOrSend(s, c.Bot(), text, markup)
+	}
+	return b.showServerList(s, c.Bot(), uid)
+}
+
+// refreshedIface — имя интерфейса по факту. Обновляем его только если интерфейс
+// реально поднят: пустой вывод (интерфейс выключен) не должен затирать iface,
+// настроенный в config.yaml вручную.
+func refreshedIface(srv ServerConfig) string {
+	out, err := execAWG(srv, "awg show interfaces")
+	if err != nil {
+		return srv.IfaceName()
+	}
+	ifaces := strings.Fields(out)
+	if len(ifaces) == 0 {
+		return srv.IfaceName()
+	}
+	return pickIface(ifaces, srv.IfaceName())
 }
 
 func (b *Bot) showError(s *UserSession, bot *tele.Bot, text string) error {
@@ -1074,6 +1174,8 @@ func (b *Bot) cbAddServer(c tele.Context) error {
 	s.PendingServerPass = ""
 	s.PendingServerMode = ""
 	s.PendingServerDir = ""
+	s.PendingServerIface = ""
+	s.PendingServerVer = AWGVersionInfo{}
 
 	text := "🖥 Новый сервер\nВведите IP-адрес:"
 	markup := &tele.ReplyMarkup{}
@@ -1132,7 +1234,7 @@ func (b *Bot) handleAddServerPass(c tele.Context, s *UserSession, input string) 
 		return b.editOrSend(s, c.Bot(), fmt.Sprintf("❌ SSH подключение не удалось: %v", sshErr), markup)
 	}
 
-	mode, dir, err := detectAWGMode(s.PendingServerIP, s.PendingServerLogin, pass)
+	det, err := detectAWGMode(s.PendingServerIP, s.PendingServerLogin, pass)
 	if err != nil {
 		// SSH works but AWG not found — offer installation
 		s.Screen = ScreenInstallConfirm
@@ -1145,15 +1247,14 @@ func (b *Bot) handleAddServerPass(c tele.Context, s *UserSession, input string) 
 		return b.editOrSend(s, c.Bot(), text, markup)
 	}
 
-	s.PendingServerMode = mode
-	s.PendingServerDir = dir
+	s.PendingServerMode = det.Mode
+	s.PendingServerDir = det.ConfDir
+	s.PendingServerIface = det.Iface
+	s.PendingServerVer = det.Version
 	s.Screen = ScreenAddServerName
 
-	modeLabel := "Docker"
-	if mode == "native" {
-		modeLabel = "Native"
-	}
-	text := fmt.Sprintf("✅ Подключение успешно!\nРежим: %s\nПуть: %s\n\nВведите имя сервера:", modeLabel, dir)
+	text := fmt.Sprintf("✅ Подключение успешно!\nРежим: %s\nВерсия: %s\nИнтерфейс: %s\nПуть: %s\n\nВведите имя сервера:",
+		modeLabel(det.Mode), versionLabel(det.Version), det.Iface, det.ConfDir)
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
 	return b.editOrSend(s, c.Bot(), text, markup)
@@ -1176,6 +1277,12 @@ func (b *Bot) handleAddServerName(c tele.Context, s *UserSession, input string) 
 		AWGConfDir:  s.PendingServerDir,
 		Port:        s.PendingInstallPort,
 		NetIface:    s.PendingNetIface,
+		AWGVersion:  int(s.PendingServerVer.Version),
+		AWGToolsVer: s.PendingServerVer.ToolsRaw,
+	}
+	// Дефолтное имя интерфейса в YAML не пишем — его подставит IfaceName().
+	if s.PendingServerIface != defaultIfaceName {
+		newSrv.Iface = s.PendingServerIface
 	}
 	if s.PendingInstallIPv6 && s.PendingIPv6Subnet != "" {
 		newSrv.IPv6Subnet = s.PendingIPv6Subnet
@@ -1486,30 +1593,39 @@ func filterVisibleClients(all []ClientEntry, uid int64, super bool) []ClientEntr
 }
 
 func (b *Bot) resolveServer(uid int64) (*ServerConfig, error) {
+	idx, err := b.resolveServerIdx(uid)
+	if err != nil {
+		return nil, err
+	}
+	cfg := b.cfg.Get()
+	return &cfg.Servers[idx], nil
+}
+
+// resolveServerIdx — индекс активного сервера пользователя в config.Servers.
+// Нужен там, где сервер требуется не только прочитать, но и обновить (SetAWGInfo).
+func (b *Bot) resolveServerIdx(uid int64) (int, error) {
 	indices := b.cfg.ServersForUser(uid)
 
 	if len(indices) == 0 {
-		return nil, fmt.Errorf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid)
+		return -1, fmt.Errorf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid)
 	}
 
 	if len(indices) == 1 {
-		cfg := b.cfg.Get()
-		return &cfg.Servers[indices[0]], nil
+		return indices[0], nil
 	}
 
 	activeIdx, ok := b.state.GetActiveServer(uid)
 	if !ok {
-		return nil, fmt.Errorf("У вас доступно %d серверов. Выберите сервер в меню.", len(indices))
+		return -1, fmt.Errorf("У вас доступно %d серверов. Выберите сервер в меню.", len(indices))
 	}
 
-	cfg := b.cfg.Get()
 	for _, idx := range indices {
 		if idx == activeIdx {
-			return &cfg.Servers[idx], nil
+			return idx, nil
 		}
 	}
 
-	return nil, fmt.Errorf("Выбранный сервер больше не доступен. Выберите другой в меню.")
+	return -1, fmt.Errorf("Выбранный сервер больше не доступен. Выберите другой в меню.")
 }
 
 // statusIcon returns emoji based on handshake recency:
@@ -1753,6 +1869,14 @@ func (b *Bot) startInstallation(s *UserSession, bot *tele.Bot, uid int64) {
 		// Success
 		s.PendingServerMode = "native"
 		s.PendingServerDir = defaultNativeDir
+		s.PendingServerIface = defaultIfaceName
+		nativeSrv := srv
+		nativeSrv.Mode = "native"
+		if info, verErr := detectAWGVersion(nativeSrv); verErr == nil {
+			s.PendingServerVer = info
+		} else {
+			log.Printf("детект версии AWG после установки: %v", verErr)
+		}
 		if diag != nil {
 			s.PendingNetIface = diag.NetIface
 		}

@@ -311,7 +311,7 @@ func TestBuildServerConf(t *testing.T) {
 	}
 
 	// Without IPv6
-	conf := buildServerConf("testPrivKey=", 51820, "eth0", params, "", "")
+	conf := buildServerConf("testPrivKey=", 51820, "eth0", params, "", "", AWGVersion2)
 	mustContain := []string{
 		"[Interface]",
 		"PrivateKey = testPrivKey=",
@@ -336,7 +336,7 @@ func TestBuildServerConf(t *testing.T) {
 	}
 
 	// With IPv6 (same subnet = /48 or /56 case)
-	confV6 := buildServerConf("testPrivKey=", 51820, "eth0", params, "fd00:awg::1/112", "fd00:awg::1/112")
+	confV6 := buildServerConf("testPrivKey=", 51820, "eth0", params, "fd00:awg::1/112", "fd00:awg::1/112", AWGVersion2)
 	if !strings.Contains(confV6, "fd00:awg::1/112") {
 		t.Error("IPv6 address not in config")
 	}
@@ -349,7 +349,7 @@ func TestBuildServerConf(t *testing.T) {
 	}
 
 	// With IPv6 (/64 case — different ifaceAddr and clientSubnet)
-	confV6_64 := buildServerConf("testPrivKey=", 51820, "eth0", params, "2a01:db8::1/64", "2a01:db8::4000/114")
+	confV6_64 := buildServerConf("testPrivKey=", 51820, "eth0", params, "2a01:db8::1/64", "2a01:db8::4000/114", AWGVersion2)
 	if !strings.Contains(confV6_64, "2a01:db8::1/64") {
 		t.Error("IPv6 iface address not in config")
 	}
@@ -534,33 +534,7 @@ func TestBuildAmneziaVPNURI(t *testing.T) {
 		t.Fatalf("URI must start with vpn://, got: %s", uri[:20])
 	}
 
-	// Decode: strip prefix → base64url decode → skip 4-byte Qt header → zlib decompress → JSON
-	encoded := uri[len("vpn://"):]
-	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		t.Fatalf("base64 decode failed: %v", err)
-	}
-
-	// Skip Qt qCompress 4-byte big-endian size header
-	if len(decoded) < 4 {
-		t.Fatalf("compressed data too short: %d bytes", len(decoded))
-	}
-
-	r, err := zlib.NewReader(bytes.NewReader(decoded[4:]))
-	if err != nil {
-		t.Fatalf("zlib reader failed: %v", err)
-	}
-	defer r.Close()
-
-	jsonBytes, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("zlib read failed: %v", err)
-	}
-
-	var cfg amneziaVPNConfig
-	if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
-		t.Fatalf("JSON unmarshal failed: %v", err)
-	}
+	cfg := decodeVPNURI(t, uri)
 
 	// Verify top-level fields
 	if cfg.HostName != "1.2.3.4" {
@@ -585,8 +559,8 @@ func TestBuildAmneziaVPNURI(t *testing.T) {
 		t.Errorf("expected port=51820, got %s", awg.Port)
 	}
 	// AWG params at container level
-	if awg.Jc != "4" {
-		t.Errorf("expected Jc=4, got %s", awg.Jc)
+	if awg.Params["Jc"] != "4" {
+		t.Errorf("expected Jc=4, got %s", awg.Params["Jc"])
 	}
 
 	// last_config must be a valid JSON string
@@ -612,6 +586,589 @@ func TestBuildAmneziaVPNURI(t *testing.T) {
 	}
 	if lcParsed["server_pub_key"] != "serverPubKey=" {
 		t.Error("last_config missing server_pub_key")
+	}
+}
+
+// decodeVPNURI разбирает vpn://-ссылку обратно в конфиг AmneziaVPN:
+// base64url → 4-байтный Qt-заголовок → zlib → JSON.
+func decodeVPNURI(t *testing.T, uri string) amneziaVPNConfig {
+	t.Helper()
+
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(uri, "vpn://"))
+	if err != nil {
+		t.Fatalf("base64 decode failed: %v", err)
+	}
+	if len(decoded) < 4 {
+		t.Fatalf("compressed data too short: %d bytes", len(decoded))
+	}
+
+	r, err := zlib.NewReader(bytes.NewReader(decoded[4:]))
+	if err != nil {
+		t.Fatalf("zlib reader failed: %v", err)
+	}
+	defer r.Close()
+
+	jsonBytes, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("zlib read failed: %v", err)
+	}
+
+	var cfg amneziaVPNConfig
+	if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
+		t.Fatalf("JSON unmarshal failed: %v", err)
+	}
+	return cfg
+}
+
+// testPrivKey — валидный Curve25519-ключ (см. TestDerivePublicKey).
+// Нужен там, где parseServerConfig выводит из него публичный ключ сервера.
+const testPrivKey = "EIW3XjQle9t8v29XijOKQo2ZQxS2+Xxq6Hr51xu4cFI="
+
+// v3Params — набор параметров сервера AWG 3.0.
+func v3Params() *ServerParams {
+	return &ServerParams{
+		PublicKey:  "serverPubKey=",
+		ListenPort: "51820",
+		AWGParams: map[string]string{
+			"Jc": "4", "Jmin": "40", "Jmax": "70",
+			"S1": "52", "S2": "27", "S3": "45", "S4": "8",
+			"H1": "100-200", "H2": "300-400", "H3": "500-600", "H4": "700-800",
+			"HeaderProtectionKey":    "aGVhZGVyS2V5MTIzNDU2Nzg5MA==",
+			"ContentPaddingAddition": "64",
+			"RekeyAfterTime":         "120",
+			"RekeyTimeout":           "5",
+			"RejectAfterTime":        "180",
+			"KeepaliveTimeout":       "10",
+			"MaxHandshakeAttempts":   "18",
+		},
+	}
+}
+
+// Регрессия: для типового awg0.conf от Amnezia (AWG 2.0, docker) клиентский
+// конфиг должен совпадать побайтово с тем, что бот выдавал до перехода на
+// зеркалирование параметров. Служебные ключи awg-quick в него не просачиваются.
+func TestBuildClientConfigAmneziaV2Golden(t *testing.T) {
+	serverConf := `[Interface]
+Address = 10.8.1.0/24
+ListenPort = 51820
+PrivateKey = ` + testPrivKey + `
+Jc = 4
+Jmin = 50
+Jmax = 1000
+S1 = 131
+S2 = 45
+S3 = 88
+S4 = 8
+H1 = 1148947297
+H2 = 1214747399
+H3 = 1710862354
+H4 = 1876997419
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; sysctl -w net.ipv4.ip_forward=1
+PostDown = iptables -D FORWARD -i %i -j ACCEPT
+
+[Peer]
+PublicKey = AAA=
+PresharedKey = pskA=
+AllowedIPs = 10.8.1.2/32
+`
+
+	params, err := parseServerConfig(serverConf)
+	if err != nil {
+		t.Fatalf("parseServerConfig failed: %v", err)
+	}
+	if params.Version != AWGVersion2 {
+		t.Errorf("Version = %v, ожидалось AWG 2.0", params.Version)
+	}
+
+	got := BuildClientConfig("clientPriv=", "psk=", "10.8.1.5", "1.2.3.4", params.ListenPort, "8.8.8.8", "8.8.4.4", params)
+
+	want := `[Interface]
+PrivateKey = clientPriv=
+Address = 10.8.1.5/32
+DNS = 8.8.8.8, 8.8.4.4
+Jc = 4
+Jmin = 50
+Jmax = 1000
+S1 = 131
+S2 = 45
+S3 = 88
+S4 = 8
+H1 = 1148947297
+H2 = 1214747399
+H3 = 1710862354
+H4 = 1876997419
+
+[Peer]
+PublicKey = v54/dW01wtlvXJ51Qic9QYe4T2dZmyg96/WuLFCkcgU=
+PresharedKey = psk=
+Endpoint = 1.2.3.4:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+`
+
+	if got != want {
+		t.Errorf("клиентский конфиг разъехался с эталоном.\n--- получено ---\n%s\n--- ожидалось ---\n%s", got, want)
+	}
+}
+
+func TestParseToolsVersion(t *testing.T) {
+	tests := []struct {
+		out     string
+		want    AWGVersion
+		wantRaw string
+	}{
+		{"amneziawg-tools v3.0.20260730\n", AWGVersion3, "3.0.20260730"},
+		{"amneziawg-tools v2.0.20250705\n", AWGVersion2, "2.0.20250705"},
+		{"amneziawg-tools v1.5.20250704\n", AWGVersion15, "1.5.20250704"},
+		{"wireguard-tools v1.0.20210914\n", AWGVersion1, "1.0.20210914"},
+		{"", AWGVersionUnknown, ""},
+		{"sh: awg: not found", AWGVersionUnknown, ""},
+	}
+	for _, tt := range tests {
+		got, raw := parseToolsVersion(tt.out)
+		if got != tt.want || raw != tt.wantRaw {
+			t.Errorf("parseToolsVersion(%q) = (%v, %q), ожидалось (%v, %q)", tt.out, got, raw, tt.want, tt.wantRaw)
+		}
+	}
+}
+
+func TestParseKmodVersion(t *testing.T) {
+	tests := []struct {
+		out     string
+		want    AWGVersion
+		wantRaw string
+	}{
+		{"version:        3.0.20260731-04\n", AWGVersion3, "3.0.20260731-04"},
+		{"version: 2.0.20250705\n", AWGVersion2, "2.0.20250705"},
+		{"", AWGVersionUnknown, ""},
+	}
+	for _, tt := range tests {
+		got, raw := parseKmodVersion(tt.out)
+		if got != tt.want || raw != tt.wantRaw {
+			t.Errorf("parseKmodVersion(%q) = (%v, %q), ожидалось (%v, %q)", tt.out, got, raw, tt.want, tt.wantRaw)
+		}
+	}
+}
+
+// Эффективная версия — более ранняя из tools и модуля ядра: tools 3.0 отправят
+// HeaderProtectionKey, а модуль 2.0 его отвергнет.
+func TestParseAWGVersionOutputTakesMin(t *testing.T) {
+	info := parseAWGVersionOutput("amneziawg-tools v3.0.20260730\nversion:        2.0.20250705\n")
+	if info.Version != AWGVersion2 {
+		t.Errorf("ожидалась AWG 2.0 (минимум из tools 3.0 и kmod 2.0), получено %v", info.Version)
+	}
+	if info.ToolsRaw != "3.0.20260730" || info.KmodRaw != "2.0.20250705" {
+		t.Errorf("сырые версии разобраны неверно: tools=%q kmod=%q", info.ToolsRaw, info.KmodRaw)
+	}
+
+	// Docker: модуля нет (userspace amneziawg-go) — берём версию tools.
+	docker := parseAWGVersionOutput("amneziawg-tools v2.0.20250705\n")
+	if docker.Version != AWGVersion2 {
+		t.Errorf("без modinfo ожидалась версия tools 2.0, получено %v", docker.Version)
+	}
+	if docker.KmodRaw != "" {
+		t.Errorf("KmodRaw должен быть пуст, получено %q", docker.KmodRaw)
+	}
+}
+
+func TestDeriveConfigVersion(t *testing.T) {
+	tests := []struct {
+		name   string
+		params map[string]string
+		want   AWGVersion
+	}{
+		{"HeaderProtectionKey → 3.0", map[string]string{"S1": "52", "S3": "45", "HeaderProtectionKey": "aaa="}, AWGVersion3},
+		{"ContentPaddingAddition → 3.0", map[string]string{"S1": "52", "ContentPaddingAddition": "64"}, AWGVersion3},
+		{"S3 → 2.0", map[string]string{"S1": "52", "S2": "27", "S3": "45"}, AWGVersion2},
+		{"S4 → 2.0", map[string]string{"S1": "52", "S4": "8"}, AWGVersion2},
+		{"диапазон H1 → 2.0", map[string]string{"S1": "52", "S2": "27", "H1": "100-200"}, AWGVersion2},
+		{"Itime → 1.5", map[string]string{"S1": "52", "Itime": "60"}, AWGVersion15},
+		{"J1 → 1.5", map[string]string{"S1": "52", "J1": "b0x"}, AWGVersion15},
+		{"только S1/S2 → 1.0", map[string]string{"S1": "52", "S2": "27", "H1": "1"}, AWGVersion1},
+		{"пусто → Unknown", map[string]string{}, AWGVersionUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveConfigVersion(&ServerParams{AWGParams: tt.params})
+			if got != tt.want {
+				t.Errorf("deriveConfigVersion = %v, ожидалось %v", got, tt.want)
+			}
+		})
+	}
+
+	if got := deriveConfigVersion(nil); got != AWGVersionUnknown {
+		t.Errorf("nil → ожидалось Unknown, получено %v", got)
+	}
+}
+
+// Неизвестный ключ из [Interface] должен доехать до AWGParams, а служебные
+// ключи awg-quick — нет.
+func TestReadServerConfigMirrorsUnknownParams(t *testing.T) {
+	conf := `[Interface]
+PrivateKey = ` + testPrivKey + `
+Address = 10.8.1.0/24
+ListenPort = 51820
+DNS = 1.1.1.1, 1.0.0.1
+MTU = 1420
+Table = off
+PostUp = iptables -A FORWARD -i %i -j ACCEPT
+PostDown = iptables -D FORWARD -i %i -j ACCEPT
+SaveConfig = false
+Jc = 4
+S3 = 45
+HeaderProtectionKey = aGVhZGVyS2V5
+Z9 = future-value
+
+[Peer]
+PublicKey = AAA=
+AllowedIPs = 10.8.1.2/32
+`
+	params, err := parseServerConfig(conf)
+	if err != nil {
+		t.Fatalf("parseServerConfig failed: %v", err)
+	}
+
+	for _, key := range []string{"Jc", "S3", "HeaderProtectionKey", "Z9"} {
+		if _, ok := params.AWGParams[key]; !ok {
+			t.Errorf("параметр %q должен зеркалиться в AWGParams", key)
+		}
+	}
+	if params.AWGParams["Z9"] != "future-value" {
+		t.Errorf("Z9 = %q, ожидалось future-value", params.AWGParams["Z9"])
+	}
+	for _, key := range []string{"PostUp", "PostDown", "MTU", "Table", "SaveConfig", "PrivateKey", "Address", "ListenPort", "DNS"} {
+		if _, ok := params.AWGParams[key]; ok {
+			t.Errorf("служебный ключ %q не должен попадать в AWGParams", key)
+		}
+	}
+
+	if len(params.ExtraParamOrder) != 1 || params.ExtraParamOrder[0] != "Z9" {
+		t.Errorf("ExtraParamOrder = %v, ожидалось [Z9]", params.ExtraParamOrder)
+	}
+	if params.DNS != "1.1.1.1, 1.0.0.1" {
+		t.Errorf("DNS = %q", params.DNS)
+	}
+	if params.Version != AWGVersion3 {
+		t.Errorf("Version = %v, ожидалось AWG 3.0", params.Version)
+	}
+	if len(params.Peers) != 1 || params.Peers[0].PublicKey != "AAA=" || params.Peers[0].AllowedIPs != "10.8.1.2/32" {
+		t.Errorf("Peers разобраны неверно: %+v", params.Peers)
+	}
+	if len(params.PeerAllowedIPs) != 1 || params.PeerAllowedIPs[0] != "10.8.1.2/32" {
+		t.Errorf("PeerAllowedIPs = %v", params.PeerAllowedIPs)
+	}
+}
+
+// Известные параметры идут в каноническом порядке, нераспознанные — следом,
+// в порядке появления в конфиге сервера.
+func TestClientParamOrderExtras(t *testing.T) {
+	params := &ServerParams{
+		AWGParams: map[string]string{
+			"S1": "52", "Jc": "4", "H1": "1",
+			"Zz": "1", "Aa": "2",
+		},
+		ExtraParamOrder: []string{"Zz", "Aa"},
+	}
+
+	got := clientParamOrder(params)
+	want := []string{"Jc", "S1", "H1", "Zz", "Aa"}
+	if len(got) != len(want) {
+		t.Fatalf("clientParamOrder = %v, ожидалось %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("clientParamOrder = %v, ожидалось %v", got, want)
+		}
+	}
+
+	if clientParamOrder(nil) != nil {
+		t.Error("nil params → ожидался nil")
+	}
+}
+
+// serverParamOrder фильтрует по версии: параметры 3.0 не попадают в конфиг 2.0,
+// а тупиковая ветка 1.5 стоит особняком в обе стороны.
+func TestServerParamOrder(t *testing.T) {
+	has := func(keys []string, k string) bool {
+		for _, x := range keys {
+			if x == k {
+				return true
+			}
+		}
+		return false
+	}
+
+	v2 := serverParamOrder(AWGVersion2)
+	if !has(v2, "S3") || !has(v2, "S4") {
+		t.Error("в 2.0 должны быть S3/S4")
+	}
+	if has(v2, "HeaderProtectionKey") {
+		t.Error("параметры 3.0 не должны попадать в конфиг 2.0")
+	}
+	if has(v2, "I1") {
+		t.Error("I1-I5 — клиентские, в серверный конфиг не пишутся")
+	}
+
+	v3 := serverParamOrder(AWGVersion3)
+	for _, k := range []string{"HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime", "MaxHandshakeAttempts"} {
+		if !has(v3, k) {
+			t.Errorf("в 3.0 должен быть %s", k)
+		}
+	}
+	if has(v3, "J1") || has(v3, "Itime") {
+		t.Error("параметров ветки 1.5 в 3.0 быть не должно")
+	}
+
+	v1 := serverParamOrder(AWGVersion1)
+	if has(v1, "S3") {
+		t.Error("в 1.0 не должно быть S3")
+	}
+}
+
+// Параметры AWG 3.0 должны доезжать до клиентского конфига без правок кода.
+func TestBuildClientConfigV3(t *testing.T) {
+	conf := BuildClientConfig("clientPrivKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", v3Params())
+
+	mustContain := []string{
+		"HeaderProtectionKey = aGVhZGVyS2V5MTIzNDU2Nzg5MA==",
+		"ContentPaddingAddition = 64",
+		"RekeyAfterTime = 120",
+		"RekeyTimeout = 5",
+		"RejectAfterTime = 180",
+		"KeepaliveTimeout = 10",
+		"MaxHandshakeAttempts = 18",
+		// H-параметры копируются как есть — диапазонами, раз на сервере диапазоны.
+		"H1 = 100-200",
+		"H4 = 700-800",
+	}
+	for _, s := range mustContain {
+		if !strings.Contains(conf, s) {
+			t.Errorf("config missing: %s\n\nFull config:\n%s", s, conf)
+		}
+	}
+}
+
+func TestBuildAmneziaVPNURIv3(t *testing.T) {
+	params := v3Params()
+
+	uri, _, err := BuildAmneziaVPNURI("clientPrivKey=", "clientPubKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", "V3Server", "8.8.8.8", "8.8.4.4", params)
+	if err != nil {
+		t.Fatalf("BuildAmneziaVPNURI failed: %v", err)
+	}
+
+	cfg := decodeVPNURI(t, uri)
+
+	// Отдельного amnezia-awg3 в приложении AmneziaVPN нет: 3.0 отдаётся как awg2.
+	if cfg.DefaultContainer != "amnezia-awg2" {
+		t.Errorf("expected defaultContainer=amnezia-awg2, got %s", cfg.DefaultContainer)
+	}
+	if len(cfg.Containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(cfg.Containers))
+	}
+	awg := cfg.Containers[0].AWG
+	if awg.ProtocolVersion != "2" {
+		t.Errorf("expected protocol_version=2, got %s", awg.ProtocolVersion)
+	}
+	if awg.Params["HeaderProtectionKey"] != "aGVhZGVyS2V5MTIzNDU2Nzg5MA==" {
+		t.Errorf("HeaderProtectionKey не доехал до контейнера: %q", awg.Params["HeaderProtectionKey"])
+	}
+
+	var lc map[string]interface{}
+	if err := json.Unmarshal([]byte(awg.LastConfig), &lc); err != nil {
+		t.Fatalf("last_config is not valid JSON: %v", err)
+	}
+	for _, key := range []string{"HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime", "MaxHandshakeAttempts"} {
+		if _, ok := lc[key]; !ok {
+			t.Errorf("last_config не содержит %s", key)
+		}
+	}
+	configStr, _ := lc["config"].(string)
+	if !strings.Contains(configStr, "HeaderProtectionKey = ") {
+		t.Error("last_config.config не содержит HeaderProtectionKey")
+	}
+}
+
+// BuildAmneziaVPNURI не должна дописывать I1-I5 в params вызывающей стороны:
+// пустой "I1 = " в клиентском .conf роняет awg-quick.
+func TestBuildAmneziaVPNURINoMutation(t *testing.T) {
+	params := &ServerParams{
+		PublicKey:  "serverPubKey=",
+		ListenPort: "51820",
+		AWGParams: map[string]string{
+			"Jc": "4", "S1": "52", "S2": "27", "S3": "45", "S4": "8",
+			"H1": "1", "H2": "2", "H3": "3", "H4": "4",
+		},
+	}
+	before := len(params.AWGParams)
+
+	if _, _, err := BuildAmneziaVPNURI("priv=", "pub=", "psk=", "10.8.1.5", "1.2.3.4", "51820", "S", "8.8.8.8", "8.8.4.4", params); err != nil {
+		t.Fatalf("BuildAmneziaVPNURI failed: %v", err)
+	}
+
+	if len(params.AWGParams) != before {
+		t.Fatalf("params.AWGParams изменился: было %d ключей, стало %d (%v)", before, len(params.AWGParams), params.AWGParams)
+	}
+	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if _, ok := params.AWGParams[k]; ok {
+			t.Errorf("в params.AWGParams появился %s", k)
+		}
+	}
+
+	// И клиентский конфиг, построенный ПОСЛЕ URI, не должен содержать пустых I1-I5.
+	conf := BuildClientConfig("priv=", "psk=", "10.8.1.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", params)
+	if strings.Contains(conf, "I1 = \n") {
+		t.Errorf("в клиентском конфиге пустой I1:\n%s", conf)
+	}
+}
+
+// При отсутствии clientsTable таблица строится из [Peer]-секций.
+func TestListClientsFromPeers(t *testing.T) {
+	peers := []PeerBlock{
+		{PublicKey: "AAA=", AllowedIPs: "10.8.1.2/32"},
+		{PublicKey: "", AllowedIPs: "10.8.1.9/32"}, // битый блок — пропускаем
+		{PublicKey: "BBB=", AllowedIPs: "10.8.1.3/32, fd00:awg::3/128"},
+	}
+
+	clients := buildClientsFromPeers(peers)
+	if len(clients) != 2 {
+		t.Fatalf("ожидалось 2 клиента, получено %d", len(clients))
+	}
+	if clients[0].ClientID != "AAA=" || clients[0].UserData.ClientName != "peer-1" || clients[0].ID != 1 {
+		t.Errorf("первый клиент разобран неверно: %+v", clients[0])
+	}
+	if clients[1].UserData.ClientName != "peer-2" || clients[1].ID != 2 {
+		t.Errorf("нумерация сбилась на битом блоке: %+v", clients[1])
+	}
+	if clients[1].UserData.AllowedIPs != "10.8.1.3/32, fd00:awg::3/128" {
+		t.Errorf("AllowedIPs потерялись: %q", clients[1].UserData.AllowedIPs)
+	}
+	for _, c := range clients {
+		if c.UserData.CreatorUID != 0 {
+			t.Errorf("восстановленный ключ должен быть «ничьим» (creatorUid=0), получено %d", c.UserData.CreatorUID)
+		}
+	}
+
+	if buildClientsFromPeers(nil) != nil {
+		t.Error("nil peers → ожидался nil")
+	}
+}
+
+func TestResolveClientDNS(t *testing.T) {
+	tests := []struct {
+		name   string
+		srv    ServerConfig
+		params *ServerParams
+		want1  string
+		want2  string
+	}{
+		{
+			name:   "yaml перебивает конфиг сервера",
+			srv:    ServerConfig{Mode: "native", DNS: "1.1.1.1, 1.0.0.1"},
+			params: &ServerParams{DNS: "9.9.9.9"},
+			want1:  "1.1.1.1", want2: "1.0.0.1",
+		},
+		{
+			name:   "один адрес в yaml — второй фолбэк",
+			srv:    ServerConfig{Mode: "native", DNS: "1.1.1.1"},
+			params: nil,
+			want1:  "1.1.1.1", want2: "8.8.4.4",
+		},
+		{
+			name:   "DNS из [Interface] серверного конфига",
+			srv:    ServerConfig{Mode: "native"},
+			params: &ServerParams{DNS: "9.9.9.9, 149.112.112.112"},
+			want1:  "9.9.9.9", want2: "149.112.112.112",
+		},
+		{
+			name:   "ничего не задано — публичный фолбэк",
+			srv:    ServerConfig{Mode: "native"},
+			params: &ServerParams{},
+			want1:  "8.8.8.8", want2: "8.8.4.4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d1, d2 := resolveClientDNS(tt.srv, tt.params)
+			if d1 != tt.want1 || d2 != tt.want2 {
+				t.Errorf("resolveClientDNS = (%s, %s), ожидалось (%s, %s)", d1, d2, tt.want1, tt.want2)
+			}
+		})
+	}
+}
+
+func TestIfaceNameDefault(t *testing.T) {
+	if got := (ServerConfig{}).IfaceName(); got != "awg0" {
+		t.Errorf("пустой Iface → ожидалось awg0, получено %s", got)
+	}
+	if got := (ServerConfig{Iface: "wg0"}).IfaceName(); got != "wg0" {
+		t.Errorf("Iface=wg0 → ожидалось wg0, получено %s", got)
+	}
+}
+
+// Два живых docker-сервера имеют пустой mode — смена дефолта их сломает.
+func TestConfDirDefaults(t *testing.T) {
+	if got := confDir(ServerConfig{}); got != defaultDockerDir {
+		t.Errorf("Mode=\"\" должен означать docker: получено %s", got)
+	}
+	if got := confDir(ServerConfig{Mode: "docker"}); got != defaultDockerDir {
+		t.Errorf("Mode=docker: получено %s", got)
+	}
+	if got := confDir(ServerConfig{Mode: "native"}); got != defaultNativeDir {
+		t.Errorf("Mode=native: получено %s", got)
+	}
+	if got := confDir(ServerConfig{Mode: "native", AWGConfDir: "/etc/wireguard"}); got != "/etc/wireguard" {
+		t.Errorf("явный awg_conf_dir: получено %s", got)
+	}
+	if got := confPath(ServerConfig{Mode: "native", Iface: "wg0"}); got != defaultNativeDir+"/wg0.conf" {
+		t.Errorf("confPath с нестандартным интерфейсом: получено %s", got)
+	}
+}
+
+// Предпочитается директория, где лежит и <iface>.conf, и clientsTable: иначе бот
+// выберет /etc/wireguard без clientsTable и будет каждый раз восстанавливать
+// таблицу из [Peer].
+func TestPickAWGConf(t *testing.T) {
+	cands := parseConfScan(
+		"/etc/wireguard|wg0|no\n" +
+			"/etc/amnezia/amneziawg|awg0|yes\n" +
+			"\n")
+	if len(cands) != 2 {
+		t.Fatalf("parseConfScan вернул %d кандидатов: %+v", len(cands), cands)
+	}
+
+	best, ok := pickAWGConf(cands, []string{"awg0"})
+	if !ok || best.Dir != "/etc/amnezia/amneziawg" || best.Iface != "awg0" {
+		t.Errorf("ожидалась /etc/amnezia/amneziawg с awg0, получено %+v", best)
+	}
+
+	// Нет clientsTable нигде — берём поднятый интерфейс.
+	onlyWG := parseConfScan("/etc/wireguard|wg0|no\n/etc/amnezia/amneziawg|awg0|no\n")
+	best, ok = pickAWGConf(onlyWG, []string{"wg0"})
+	if !ok || best.Iface != "wg0" {
+		t.Errorf("ожидался поднятый wg0, получено %+v", best)
+	}
+
+	if _, ok := pickAWGConf(nil, nil); ok {
+		t.Error("пустой список кандидатов → ожидалось false")
+	}
+}
+
+func TestPickIface(t *testing.T) {
+	if got := pickIface([]string{"wg0", "awg0"}, ""); got != "awg0" {
+		t.Errorf("без предпочтения ожидался awg0, получено %s", got)
+	}
+	if got := pickIface([]string{"wg0", "awg0"}, "wg0"); got != "wg0" {
+		t.Errorf("настроенный wg0 приоритетнее, получено %s", got)
+	}
+	if got := pickIface([]string{"wg1"}, ""); got != "wg1" {
+		t.Errorf("единственный интерфейс должен выбираться, получено %s", got)
+	}
+	if got := pickIface(nil, "wg0"); got != "wg0" {
+		t.Errorf("пустой список → сохраняем настроенный, получено %s", got)
+	}
+	if got := pickIface(nil, ""); got != "awg0" {
+		t.Errorf("пустой список без предпочтения → awg0, получено %s", got)
 	}
 }
 

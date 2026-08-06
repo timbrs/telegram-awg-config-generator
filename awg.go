@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	containerName     = "amnezia-awg2"
-	ifaceName         = "awg0"
-	defaultDockerDir  = "/opt/amnezia/awg"
-	defaultNativeDir  = "/etc/amnezia/amneziawg"
+	containerName = "amnezia-awg2"
+	// defaultIfaceName — имя интерфейса по умолчанию. Использовать напрямую можно
+	// только там, где интерфейс создаётся самим ботом (установка AWG); для работы
+	// с уже настроенным сервером берите srv.IfaceName().
+	defaultIfaceName = "awg0"
+	defaultDockerDir = "/opt/amnezia/awg"
+	defaultNativeDir = "/etc/amnezia/amneziawg"
 )
 
 // confDir returns the AWG config directory for the server.
@@ -33,9 +36,9 @@ func confDir(srv ServerConfig) string {
 	return defaultDockerDir
 }
 
-// confPath returns the full path to awg0.conf.
+// confPath returns the full path to <iface>.conf.
 func confPath(srv ServerConfig) string {
-	return confDir(srv) + "/" + ifaceName + ".conf"
+	return confDir(srv) + "/" + srv.IfaceName() + ".conf"
 }
 
 // clientsTablePath returns the full path to clientsTable.
@@ -60,29 +63,42 @@ func readFileOnServer(srv ServerConfig, path string) (string, error) {
 }
 
 // writeFileOnServer writes data to a file on the server via base64.
+//
+// umask 077 + chmod 600 обязательны: под дефолтным umask 022 приватный ключ
+// сервера в awg0.conf становится world-readable, а `awg-quick strip` ругается
+// на права, отличные от 0600.
 func writeFileOnServer(srv ServerConfig, path string, data []byte) error {
-	encoded := base64Encode(data)
+	cmd := fmt.Sprintf("bash -c 'umask 077; printf %%s %s | base64 -d > %s && chmod 600 %s'",
+		base64Encode(data), path, path)
 	if srv.Mode == "native" {
-		cmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d > %s'", encoded, path)
 		_, err := SSHRun(srv, cmd)
 		return err
 	}
-	cmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d > %s'", encoded, path)
 	_, err := SSHRun(srv, fmt.Sprintf("docker exec %s %s", containerName, cmd))
 	return err
 }
 
 // appendFileOnServer appends data to a file on the server via base64.
 func appendFileOnServer(srv ServerConfig, path string, data []byte) error {
-	encoded := base64Encode(data)
+	cmd := fmt.Sprintf("bash -c 'umask 077; printf %%s %s | base64 -d >> %s'",
+		base64Encode(data), path)
 	if srv.Mode == "native" {
-		cmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d >> %s'", encoded, path)
 		_, err := SSHRun(srv, cmd)
 		return err
 	}
-	cmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d >> %s'", encoded, path)
 	_, err := SSHRun(srv, fmt.Sprintf("docker exec %s %s", containerName, cmd))
 	return err
+}
+
+// fileExistsOnServer проверяет наличие файла. Команда всегда завершается
+// успешно, поэтому «файла нет» надёжно отличается от «SSH не отработал»:
+// SSHRun не различает ненулевой exit code и обрыв соединения.
+func fileExistsOnServer(srv ServerConfig, path string) (bool, error) {
+	out, err := execAWG(srv, fmt.Sprintf("sh -c 'test -f %s && echo AWGYES || echo AWGNO'", path))
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(out, "AWGYES"), nil
 }
 
 type ClientData struct {
@@ -104,18 +120,36 @@ type ClientEntry struct {
 	ID       int        `json:"-"` // sequential 1-based ID
 }
 
+// PeerBlock — одна [Peer]-секция серверного конфига.
+type PeerBlock struct {
+	PublicKey  string
+	AllowedIPs string
+}
+
 type ServerParams struct {
 	PrivateKey string
 	PublicKey  string
 	Address    string
 	ListenPort string
 	DNS        string
-	// AWG obfuscation params — stored as map for flexibility
+	// AWGParams — ВСЕ obfuscation-параметры из [Interface] серверного конфига.
+	// Клиентские значения не вычисляются, а копируются отсюда: так must-match
+	// параметры (S1-S4, H1-H4, HeaderProtectionKey) физически не могут
+	// разъехаться между сервером и клиентом, а новая версия протокола
+	// подхватывается без правок кода.
 	AWGParams map[string]string
+	// ExtraParamOrder — ключи вне awgParamSpecs, в порядке появления в конфиге.
+	// Нужен, чтобы вывод нераспознанных параметров был детерминированным.
+	ExtraParamOrder []string
+	// Version — версия протокола, выведенная из набора параметров конфига.
+	Version AWGVersion
 	// PeerAllowedIPs — AllowedIPs из всех [Peer]-секций awg0.conf. Нужен, чтобы
 	// видеть реально занятые адреса (в т.ч. клиентов, созданных самим Amnezia,
 	// которых может не быть в clientsTable).
 	PeerAllowedIPs []string
+	// Peers — [Peer]-секции целиком. Нужны, чтобы восстановить clientsTable на
+	// сервере, настроенном вручную (без Amnezia).
+	Peers []PeerBlock
 }
 
 func base64Encode(data []byte) string {
@@ -157,6 +191,89 @@ func writeClientsTable(srv ServerConfig, clients []ClientEntry) error {
 	return nil
 }
 
+// clientsFromPeers восстанавливает список клиентов из [Peer]-секций конфига.
+func clientsFromPeers(srv ServerConfig) ([]ClientEntry, error) {
+	params, err := ReadServerConfig(srv)
+	if err != nil {
+		return nil, fmt.Errorf("восстановление clientsTable из конфига: %w", err)
+	}
+	log.Printf("AWG (%s): clientsTable не найден, восстанавливаю из [Peer]-секций (%d шт.)", srv.Name, len(params.Peers))
+	return buildClientsFromPeers(params.Peers), nil
+}
+
+// buildClientsFromPeers — чистая часть clientsFromPeers.
+func buildClientsFromPeers(peers []PeerBlock) []ClientEntry {
+	var entries []ClientEntry
+	for _, p := range peers {
+		if p.PublicKey == "" {
+			continue
+		}
+		n := len(entries) + 1
+		entries = append(entries, ClientEntry{
+			ClientID: p.PublicKey,
+			UserData: ClientData{
+				AllowedIPs:      p.AllowedIPs,
+				ClientName:      fmt.Sprintf("peer-%d", n),
+				CreationDate:    "unknown",
+				DataReceived:    "0 B",
+				DataSent:        "0 B",
+				LatestHandshake: "never",
+				// CreatorUID = 0 — ключ «ничей», виден всем админам сервера.
+			},
+			ID: n,
+		})
+	}
+	return entries
+}
+
+// resolveClientDNS выбирает DNS для клиентского конфига по убыванию приоритета:
+//  1. srv.DNS из config.yaml — явный выбор админа, без SSH;
+//  2. DNS = из [Interface] серверного конфига (уже в ServerParams.DNS);
+//  3. контейнер amnezia-dns — только в docker-режиме;
+//  4. 8.8.8.8 / 8.8.4.4.
+func resolveClientDNS(srv ServerConfig, params *ServerParams) (dns1, dns2 string) {
+	const fallback1, fallback2 = "8.8.8.8", "8.8.4.4"
+
+	if d1, d2, ok := splitDNSPair(srv.DNS); ok {
+		return d1, orDefault(d2, fallback2)
+	}
+	if params != nil {
+		if d1, d2, ok := splitDNSPair(params.DNS); ok {
+			return d1, orDefault(d2, fallback2)
+		}
+	}
+	if srv.Mode != "native" {
+		if ip := GetAmneziaDNSIP(srv); ip != "" {
+			return ip, fallback2
+		}
+	}
+	return fallback1, fallback2
+}
+
+// splitDNSPair разбирает "1.1.1.1, 1.0.0.1" на пару адресов.
+func splitDNSPair(s string) (dns1, dns2 string, ok bool) {
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		switch {
+		case dns1 == "":
+			dns1 = part
+		case dns2 == "":
+			dns2 = part
+		}
+	}
+	return dns1, dns2, dns1 != ""
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
 func GetAmneziaDNSIP(srv ServerConfig) string {
 	if srv.Mode == "native" {
 		return "" // no Docker DNS container in native mode
@@ -172,10 +289,22 @@ func GetAmneziaDNSIP(srv ServerConfig) string {
 	return ip
 }
 
+// ListClients возвращает клиентов из clientsTable. Если файла нет (сервер настроен
+// вручную, а не через Amnezia), таблица восстанавливается из [Peer]-секций конфига:
+// имя = "peer-N", creatorUid = 0 (ключ «ничей», виден всем админам).
+//
+// Восстановленная таблица НЕ пишется на сервер при чтении — только при следующем
+// изменении (AddPeer/RemovePeer вызывают writeClientsTable сами). Чтение без
+// побочных эффектов, к тому же так настоящая таблица, временно недоступная из-за
+// сетевой ошибки, не будет затёрта: «файла нет» проверяется явным test -f.
 func ListClients(srv ServerConfig) ([]ClientEntry, error) {
 	output, err := readFileOnServer(srv, clientsTablePath(srv))
 	if err != nil {
-		return nil, fmt.Errorf("чтение clientsTable: %w", err)
+		exists, testErr := fileExistsOnServer(srv, clientsTablePath(srv))
+		if testErr != nil || exists {
+			return nil, fmt.Errorf("чтение clientsTable: %w", err)
+		}
+		return clientsFromPeers(srv)
 	}
 
 	output = strings.TrimSpace(output)
@@ -200,26 +329,43 @@ func ReadServerConfig(srv ServerConfig) (*ServerParams, error) {
 	if err != nil {
 		return nil, fmt.Errorf("чтение awg конфига: %w", err)
 	}
+	return parseServerConfig(output)
+}
 
+// parseServerConfig разбирает текст awg0.conf. Вынесен из ReadServerConfig,
+// чтобы покрываться тестами без SSH.
+//
+// Параметры обфускации распознаются по принципу blacklist: всё, что в
+// [Interface] не является служебным ключом awg-quick (reservedInterfaceKeys), —
+// параметр AmneziaWG, и он зеркалится в клиентский конфиг как есть. Так новая
+// версия протокола (3.0, 4.0, …) поддерживается без правок кода.
+func parseServerConfig(output string) (*ServerParams, error) {
 	params := &ServerParams{AWGParams: make(map[string]string)}
-	// Known AWG obfuscation parameter names
-	awgKeys := map[string]bool{
-		"Jc": true, "Jmin": true, "Jmax": true,
-		"S1": true, "S2": true, "S3": true, "S4": true,
-		"H1": true, "H2": true, "H3": true, "H4": true,
-		"I1": true, "I2": true, "I3": true, "I4": true, "I5": true,
+
+	var curPeer *PeerBlock
+	flushPeer := func() {
+		if curPeer == nil {
+			return
+		}
+		params.Peers = append(params.Peers, *curPeer)
+		if curPeer.AllowedIPs != "" {
+			params.PeerAllowedIPs = append(params.PeerAllowedIPs, curPeer.AllowedIPs)
+		}
+		curPeer = nil
 	}
 
-	lines := strings.Split(output, "\n")
 	section := ""
-	for _, line := range lines {
+	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "[Interface]" {
+			flushPeer()
 			section = "interface"
 			continue
 		}
 		if line == "[Peer]" {
+			flushPeer()
 			section = "peer"
+			curPeer = &PeerBlock{}
 			continue
 		}
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -244,16 +390,34 @@ func ReadServerConfig(srv ServerConfig) (*ServerParams, error) {
 			case "DNS":
 				params.DNS = val
 			default:
-				if awgKeys[key] {
-					params.AWGParams[key] = val
+				if reservedInterfaceKeys[key] {
+					continue
 				}
+				if _, dup := params.AWGParams[key]; !dup {
+					if _, known := awgParamMinVer[key]; !known {
+						// Параметр из версии протокола, которой бот ещё не знает.
+						// Зеркалим его всё равно — но пусть будет виден в журнале.
+						log.Printf("AWG: неизвестный параметр %q в [Interface] — копирую в клиентский конфиг как есть", key)
+						params.ExtraParamOrder = append(params.ExtraParamOrder, key)
+					}
+				}
+				params.AWGParams[key] = val
 			}
 		case "peer":
-			if key == "AllowedIPs" {
-				params.PeerAllowedIPs = append(params.PeerAllowedIPs, val)
+			if curPeer == nil {
+				continue
+			}
+			switch key {
+			case "PublicKey":
+				curPeer.PublicKey = val
+			case "AllowedIPs":
+				curPeer.AllowedIPs = val
 			}
 		}
 	}
+	flushPeer()
+
+	params.Version = deriveConfigVersion(params)
 
 	// Derive public key from private key locally (Curve25519).
 	pub, err := derivePublicKey(params.PrivateKey)
@@ -552,10 +716,7 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 		return "", "", err
 	}
 
-	dns1, dns2 := "8.8.8.8", "8.8.4.4"
-	if dnsIP := GetAmneziaDNSIP(srv); dnsIP != "" {
-		dns1 = dnsIP
-	}
+	dns1, dns2 := resolveClientDNS(srv, srvParams)
 
 	// IPv6 allocation
 	clientIPv6 := ""
@@ -603,10 +764,8 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 		return "", "", err
 	}
 
-	// Reload interface (bash needed for process substitution)
-	reloadCmd := fmt.Sprintf("bash -c 'awg syncconf %s <(awg-quick strip %s)'", ifaceName, confPath(srv))
-	if _, err := execAWG(srv, reloadCmd); err != nil {
-		return "", "", fmt.Errorf("перезагрузка интерфейса: %w", err)
+	if err := reloadInterface(srv, false); err != nil {
+		return "", "", err
 	}
 
 	// Build client config (AmneziaWG format).
@@ -621,6 +780,36 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 	}
 
 	return clientConf, vpnURI, nil
+}
+
+// reloadInterface перечитывает конфиг интерфейса.
+//
+// full=true — полный рестарт сервиса: он нужен, когда из конфига УДАЛЯЛИСЬ
+// параметры, потому что `awg syncconf` умеет добавлять и менять их, но не
+// снимать. Для добавления и удаления пиров хватает syncconf.
+func reloadInterface(srv ServerConfig, full bool) error {
+	iface := srv.IfaceName()
+
+	if full {
+		if srv.Mode == "native" {
+			if _, err := SSHRun(srv, fmt.Sprintf("systemctl restart awg-quick@%s", iface)); err != nil {
+				return fmt.Errorf("рестарт интерфейса: %w", err)
+			}
+			return nil
+		}
+		cmd := fmt.Sprintf("bash -c 'awg-quick down %s; awg-quick up %s'", iface, iface)
+		if _, err := execAWG(srv, cmd); err != nil {
+			return fmt.Errorf("рестарт интерфейса: %w", err)
+		}
+		return nil
+	}
+
+	// bash нужен для process substitution <(...)
+	cmd := fmt.Sprintf("bash -c 'awg syncconf %s <(awg-quick strip %s)'", iface, confPath(srv))
+	if _, err := execAWG(srv, cmd); err != nil {
+		return fmt.Errorf("перезагрузка интерфейса: %w", err)
+	}
+	return nil
 }
 
 func removePeerBlock(confText, pubKey string) string {
@@ -665,7 +854,7 @@ func removePeerBlock(confText, pubKey string) string {
 
 func RemovePeer(srv ServerConfig, pubKey string) error {
 	// Remove from awg interface
-	removeCmd := fmt.Sprintf("awg set %s peer %s remove", ifaceName, pubKey)
+	removeCmd := fmt.Sprintf("awg set %s peer %s remove", srv.IfaceName(), pubKey)
 	if _, err := execAWG(srv, removeCmd); err != nil {
 		return fmt.Errorf("удаление пира из интерфейса: %w", err)
 	}
@@ -711,7 +900,7 @@ type PeerStats struct {
 
 // AWGShow runs "awg show <iface>" and parses per-peer stats keyed by public key.
 func AWGShow(srv ServerConfig) (map[string]PeerStats, error) {
-	output, err := execAWG(srv, fmt.Sprintf("awg show %s", ifaceName))
+	output, err := execAWG(srv, fmt.Sprintf("awg show %s", srv.IfaceName()))
 	if err != nil {
 		return nil, fmt.Errorf("awg show: %w", err)
 	}
@@ -771,7 +960,7 @@ type PeerTraffic struct {
 
 // AWGShowDump runs "awg show <iface> dump" and returns raw byte counts per peer.
 func AWGShowDump(srv ServerConfig) ([]PeerTraffic, error) {
-	output, err := execAWG(srv, fmt.Sprintf("awg show %s dump", ifaceName))
+	output, err := execAWG(srv, fmt.Sprintf("awg show %s dump", srv.IfaceName()))
 	if err != nil {
 		return nil, fmt.Errorf("awg show dump: %w", err)
 	}
@@ -844,11 +1033,9 @@ func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2 
 	}
 	sb.WriteString(fmt.Sprintf("DNS = %s\n", dnsLine))
 
-	// Write AWG params in deterministic order
-	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"} {
-		if val, ok := params.AWGParams[key]; ok {
-			sb.WriteString(fmt.Sprintf("%s = %s\n", key, val))
-		}
+	// Параметры обфускации копируются с сервера как есть, в детерминированном порядке.
+	for _, key := range clientParamOrder(params) {
+		sb.WriteString(fmt.Sprintf("%s = %s\n", key, params.AWGParams[key]))
 	}
 
 	sb.WriteString("\n[Peer]\n")
@@ -877,48 +1064,106 @@ type amneziaContainer struct {
 	AWG       amneziaAWGData `json:"awg"`
 }
 
+// amneziaAWGData — секция "awg" контейнера в конфиге AmneziaVPN.
+//
+// Параметры обфускации лежат в Params и попадают в JSON плоско, рядом с
+// фиксированными полями. Фиксированной структурой их описать нельзя: набор
+// параметров задаёт версия протокола на сервере, и каждая новая версия
+// (3.0, 4.0, …) требовала бы правки полей.
 type amneziaAWGData struct {
-	Jc              string `json:"Jc,omitempty"`
-	Jmin            string `json:"Jmin,omitempty"`
-	Jmax            string `json:"Jmax,omitempty"`
-	S1              string `json:"S1,omitempty"`
-	S2              string `json:"S2,omitempty"`
-	S3              string `json:"S3,omitempty"`
-	S4              string `json:"S4,omitempty"`
-	H1              string `json:"H1,omitempty"`
-	H2              string `json:"H2,omitempty"`
-	H3              string `json:"H3,omitempty"`
-	H4              string `json:"H4,omitempty"`
-	I1              string `json:"I1"`
-	I2              string `json:"I2"`
-	I3              string `json:"I3"`
-	I4              string `json:"I4"`
-	I5              string `json:"I5"`
-	LastConfig      string `json:"last_config"`
-	Port            string `json:"port"`
-	ProtocolVersion string `json:"protocol_version"`
-	SubnetAddress   string `json:"subnet_address,omitempty"`
-	TransportProto  string `json:"transport_proto"`
+	LastConfig      string
+	Port            string
+	ProtocolVersion string
+	SubnetAddress   string
+	TransportProto  string
+	Params          map[string]string
+}
+
+// amneziaAWGFixedKeys — не-параметрические ключи секции "awg".
+var amneziaAWGFixedKeys = map[string]bool{
+	"last_config": true, "port": true, "protocol_version": true,
+	"subnet_address": true, "transport_proto": true,
+}
+
+func (a amneziaAWGData) MarshalJSON() ([]byte, error) {
+	m := map[string]string{
+		"last_config":      a.LastConfig,
+		"port":             a.Port,
+		"protocol_version": a.ProtocolVersion,
+		"transport_proto":  a.TransportProto,
+	}
+	if a.SubnetAddress != "" {
+		m["subnet_address"] = a.SubnetAddress
+	}
+	for key, val := range a.Params {
+		if amneziaAWGFixedKeys[key] {
+			continue
+		}
+		m[key] = val
+	}
+	// json.Marshal сортирует ключи map — порядок детерминирован.
+	return json.Marshal(m)
+}
+
+func (a *amneziaAWGData) UnmarshalJSON(data []byte) error {
+	var raw map[string]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	a.Params = make(map[string]string)
+	for key, val := range raw {
+		switch key {
+		case "last_config":
+			a.LastConfig = val
+		case "port":
+			a.Port = val
+		case "protocol_version":
+			a.ProtocolVersion = val
+		case "subnet_address":
+			a.SubnetAddress = val
+		case "transport_proto":
+			a.TransportProto = val
+		default:
+			a.Params[key] = val
+		}
+	}
+	return nil
 }
 
 // BuildAmneziaVPNURI builds a vpn:// URI for AmneziaVPN app.
 func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, serverName, dns1, dns2 string, params *ServerParams) (vpnURI string, compressedData []byte, err error) {
-	// Determine container type: awg2 if S3/S4 present, otherwise awg
+	// Работаем с КОПИЕЙ параметров: дописывать I1-I5 прямо в params.AWGParams
+	// нельзя — это данные вызывающей стороны, и пустой "I1 = " в клиентском
+	// .conf роняет awg-quick. Раньше от этого спасал лишь порядок вызовов в
+	// AddPeer (BuildClientConfig до BuildAmneziaVPNURI).
+	local := &ServerParams{
+		PublicKey:       params.PublicKey,
+		ExtraParamOrder: params.ExtraParamOrder,
+		AWGParams:       make(map[string]string, len(params.AWGParams)+5),
+	}
+	for k, v := range params.AWGParams {
+		local.AWGParams[k] = v
+	}
+
+	// Тип контейнера — это версия контейнера Amnezia, а не протокола AWG:
+	// отдельного amnezia-awg3 в приложении AmneziaVPN нет, поэтому все версии
+	// протокола ≥ 2.0 отдаются как amnezia-awg2 / protocol_version = 2.
 	containerType := "amnezia-awg"
 	protoVersion := "1"
-	if _, hasS3 := params.AWGParams["S3"]; hasS3 {
+	if versionRank(deriveConfigVersion(params)) >= versionRank(AWGVersion2) {
 		containerType = "amnezia-awg2"
 		protoVersion = "2"
-		// Ensure I1-I5 exist for v2 (empty string if not set by server)
+		// Приложение AmneziaVPN ожидает ключи I1-I5 в контейнере awg2;
+		// если сервер их не задаёт — отдаём пустыми.
 		for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
-			if _, ok := params.AWGParams[k]; !ok {
-				params.AWGParams[k] = ""
+			if _, ok := local.AWGParams[k]; !ok {
+				local.AWGParams[k] = ""
 			}
 		}
 	}
 
 	// Build the full WG+AWG config text
-	confText := BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2, params)
+	confText := BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2, local)
 
 	// Parse port as integer for last_config (AmneziaVPN expects number)
 	portNum, _ := strconv.Atoi(serverPort)
@@ -939,10 +1184,8 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 		"allowed_ips":           []string{"0.0.0.0/0", "::/0"},
 	}
 	// Copy ALL AWG params into last_config (including I1-I5 for v2)
-	for _, key := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"} {
-		if v, ok := params.AWGParams[key]; ok {
-			lastConfigMap[key] = v
-		}
+	for _, key := range clientParamOrder(local) {
+		lastConfigMap[key] = local.AWGParams[key]
 	}
 	lastConfigBytes, err2 := json.MarshalIndent(lastConfigMap, "", "    ")
 	if err2 != nil {
@@ -955,61 +1198,17 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 		subnetAddr = parts[0] + "." + parts[1] + "." + parts[2] + ".0"
 	}
 
+	// Duplicate AWG params at container level
 	awgData := amneziaAWGData{
 		LastConfig:      string(lastConfigBytes),
 		Port:            serverPort,
 		ProtocolVersion: protoVersion,
 		SubnetAddress:   subnetAddr,
 		TransportProto:  "udp",
+		Params:          make(map[string]string, len(local.AWGParams)),
 	}
-	// Duplicate AWG params at container level
-	if v, ok := params.AWGParams["Jc"]; ok {
-		awgData.Jc = v
-	}
-	if v, ok := params.AWGParams["Jmin"]; ok {
-		awgData.Jmin = v
-	}
-	if v, ok := params.AWGParams["Jmax"]; ok {
-		awgData.Jmax = v
-	}
-	if v, ok := params.AWGParams["S1"]; ok {
-		awgData.S1 = v
-	}
-	if v, ok := params.AWGParams["S2"]; ok {
-		awgData.S2 = v
-	}
-	if v, ok := params.AWGParams["S3"]; ok {
-		awgData.S3 = v
-	}
-	if v, ok := params.AWGParams["S4"]; ok {
-		awgData.S4 = v
-	}
-	if v, ok := params.AWGParams["H1"]; ok {
-		awgData.H1 = v
-	}
-	if v, ok := params.AWGParams["H2"]; ok {
-		awgData.H2 = v
-	}
-	if v, ok := params.AWGParams["H3"]; ok {
-		awgData.H3 = v
-	}
-	if v, ok := params.AWGParams["H4"]; ok {
-		awgData.H4 = v
-	}
-	if v, ok := params.AWGParams["I1"]; ok {
-		awgData.I1 = v
-	}
-	if v, ok := params.AWGParams["I2"]; ok {
-		awgData.I2 = v
-	}
-	if v, ok := params.AWGParams["I3"]; ok {
-		awgData.I3 = v
-	}
-	if v, ok := params.AWGParams["I4"]; ok {
-		awgData.I4 = v
-	}
-	if v, ok := params.AWGParams["I5"]; ok {
-		awgData.I5 = v
+	for _, key := range clientParamOrder(local) {
+		awgData.Params[key] = local.AWGParams[key]
 	}
 
 	cfg := amneziaVPNConfig{
@@ -1057,30 +1256,173 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 	return uri, compressed, nil
 }
 
-// detectAWGMode connects via SSH and determines AWG mode (docker/native) and config directory.
-func detectAWGMode(ip, login, pass string) (mode string, awgConfDir string, err error) {
-	tmpSrv := ServerConfig{IP: ip, Login: login, Pass: pass}
+// DetectedServer — всё, что бот выяснил о сервере за один заход по SSH.
+type DetectedServer struct {
+	Mode    string // "docker" / "native"
+	ConfDir string
+	Iface   string
+	Version AWGVersionInfo
+}
 
-	// Try Docker first
-	dockerCmd := fmt.Sprintf("docker exec %s awg show %s", containerName, ifaceName)
-	if _, err := SSHRun(tmpSrv, dockerCmd); err == nil {
-		return "docker", defaultDockerDir, nil
+// awgConfDirCandidates — где искать конфиг AWG на нативной установке.
+var awgConfDirCandidates = []string{
+	defaultNativeDir, // /etc/amnezia/amneziawg
+	"/etc/wireguard",
+	defaultDockerDir, // /opt/amnezia/awg
+}
+
+// awgConfCandidate — найденный на сервере конфиг AWG.
+type awgConfCandidate struct {
+	Dir             string
+	Iface           string
+	HasClientsTable bool
+}
+
+// detectAWGMode connects via SSH and determines AWG mode (docker/native),
+// config directory, interface name and protocol version.
+//
+// Порядок «docker → native» намеренный: контейнер AmneziaVPN пробуется первым,
+// потому что именно там живут реальные клиенты. Native — полноправная
+// альтернатива, а не замена.
+func detectAWGMode(ip, login, pass string) (*DetectedServer, error) {
+	// Name проставляем, иначе SSH-ошибки печатаются с пустым именем сервера.
+	tmpSrv := ServerConfig{Name: ip, IP: ip, Login: login, Pass: pass}
+
+	// --- Docker ---
+	if out, err := execAWG(tmpSrv, "awg show interfaces"); err == nil {
+		det := &DetectedServer{
+			Mode:    "docker",
+			ConfDir: defaultDockerDir,
+			Iface:   pickIface(strings.Fields(out), ""),
+		}
+		det.Version, _ = detectAWGVersion(withDetected(tmpSrv, det))
+		return det, nil
 	}
 
-	// Try native
-	if _, err := SSHRun(tmpSrv, fmt.Sprintf("awg show %s", ifaceName)); err == nil {
-		// Check known config paths
-		paths := []string{
-			"/etc/amnezia/amneziawg",
-			"/etc/wireguard",
-		}
-		for _, p := range paths {
-			if _, testErr := SSHRun(tmpSrv, fmt.Sprintf("test -f %s/%s.conf", p, ifaceName)); testErr == nil {
-				return "native", p, nil
-			}
-		}
-		return "native", defaultNativeDir, nil
+	// --- Native ---
+	nativeSrv := tmpSrv
+	nativeSrv.Mode = "native"
+	out, err := SSHRun(nativeSrv, "awg show interfaces")
+	if err != nil {
+		return nil, fmt.Errorf("AWG не обнаружен на сервере %s", ip)
 	}
 
-	return "", "", fmt.Errorf("AWG не обнаружен на сервере %s", ip)
+	liveIfaces := strings.Fields(out)
+	cands := scanAWGConfDirs(nativeSrv)
+	best, found := pickAWGConf(cands, liveIfaces)
+	if len(liveIfaces) == 0 && !found {
+		// Инструменты AWG стоят, но ни интерфейса, ни конфига нет — считаем,
+		// что сервер не настроен, и предлагаем установку.
+		return nil, fmt.Errorf("AWG не обнаружен на сервере %s", ip)
+	}
+
+	det := &DetectedServer{Mode: "native", ConfDir: defaultNativeDir, Iface: pickIface(liveIfaces, "")}
+	if found {
+		det.ConfDir = best.Dir
+		det.Iface = best.Iface
+	}
+	det.Version, _ = detectAWGVersion(withDetected(nativeSrv, det))
+	return det, nil
+}
+
+// withDetected возвращает копию srv с уже известными режимом и интерфейсом,
+// чтобы последующие команды шли на правильный интерфейс и через нужный транспорт.
+func withDetected(srv ServerConfig, det *DetectedServer) ServerConfig {
+	srv.Mode = det.Mode
+	srv.AWGConfDir = det.ConfDir
+	srv.Iface = det.Iface
+	return srv
+}
+
+// pickIface выбирает интерфейс из вывода `awg show interfaces`: prefer (уже
+// настроенный в config.yaml), если он в списке, иначе awg0, иначе первый.
+// При пустом списке — prefer, а если он пуст, то дефолт.
+func pickIface(ifaces []string, prefer string) string {
+	if prefer == "" {
+		prefer = defaultIfaceName
+	}
+	for _, i := range ifaces {
+		if i == prefer {
+			return i
+		}
+	}
+	for _, i := range ifaces {
+		if i == defaultIfaceName {
+			return i
+		}
+	}
+	if len(ifaces) > 0 {
+		return ifaces[0]
+	}
+	return prefer
+}
+
+// scanAWGConfDirs ищет конфиги AWG в известных директориях ОДНОЙ командой:
+// каждая SSH-сессия — это новый Dial, лишние обходятся дорого.
+func scanAWGConfDirs(srv ServerConfig) []awgConfCandidate {
+	script := fmt.Sprintf(
+		`for d in %s; do [ -d "$d" ] || continue; for f in "$d"/*.conf; do [ -f "$f" ] || continue; `+
+			`t=no; [ -f "$d/clientsTable" ] && t=yes; echo "$d|$(basename "$f" .conf)|$t"; done; done`,
+		strings.Join(awgConfDirCandidates, " "))
+
+	out, err := SSHRun(srv, fmt.Sprintf("sh -c '%s'", script))
+	if err != nil {
+		return nil
+	}
+	return parseConfScan(out)
+}
+
+// parseConfScan — чистый разбор вывода scanAWGConfDirs ("<dir>|<iface>|yes|no").
+func parseConfScan(out string) []awgConfCandidate {
+	var cands []awgConfCandidate
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "|")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+			continue
+		}
+		cands = append(cands, awgConfCandidate{
+			Dir:             parts[0],
+			Iface:           parts[1],
+			HasClientsTable: parts[2] == "yes",
+		})
+	}
+	return cands
+}
+
+// pickAWGConf выбирает лучшую директорию с конфигом. Приоритет — та, где лежит
+// И <iface>.conf поднятого интерфейса, И clientsTable: иначе бот может выбрать
+// /etc/wireguard, где clientsTable нет, и ListClients будет каждый раз
+// восстанавливать таблицу из [Peer] вместо настоящей.
+func pickAWGConf(cands []awgConfCandidate, liveIfaces []string) (awgConfCandidate, bool) {
+	if len(cands) == 0 {
+		return awgConfCandidate{}, false
+	}
+
+	live := make(map[string]bool, len(liveIfaces))
+	for _, i := range liveIfaces {
+		live[i] = true
+	}
+
+	// score: чем больше, тем лучше.
+	score := func(c awgConfCandidate) int {
+		s := 0
+		if c.HasClientsTable {
+			s += 4
+		}
+		if live[c.Iface] {
+			s += 2
+		}
+		if c.Iface == defaultIfaceName {
+			s++
+		}
+		return s
+	}
+
+	best := cands[0]
+	for _, c := range cands[1:] {
+		if score(c) > score(best) {
+			best = c
+		}
+	}
+	return best, true
 }
