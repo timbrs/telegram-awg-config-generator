@@ -88,7 +88,7 @@ var awgParamSpecs = []awgParamSpec{
 	{"MaxHandshakeAttempts", AWGVersion3, true},
 }
 
-// awgParamMinVer — индекс awgParamSpecs по имени ключа.
+// awgParamMinVer — индекс awgParamSpecs по каноническому имени ключа.
 var awgParamMinVer = func() map[string]AWGVersion {
 	m := make(map[string]AWGVersion, len(awgParamSpecs))
 	for _, spec := range awgParamSpecs {
@@ -97,15 +97,28 @@ var awgParamMinVer = func() map[string]AWGVersion {
 	return m
 }()
 
+// awgParamCanonical — имя в нижнем регистре → каноническое написание.
+// Парсер awg-quick регистронезависим, поэтому в конфиге может стоять `jc = 4`;
+// бот приводит такие ключи к каноническому виду, чтобы они не потерялись в
+// clientParamOrder.
+var awgParamCanonical = func() map[string]string {
+	m := make(map[string]string, len(awgParamSpecs))
+	for _, spec := range awgParamSpecs {
+		m[strings.ToLower(spec.Key)] = spec.Key
+	}
+	return m
+}()
+
 // reservedInterfaceKeys — ключи [Interface], которые обрабатывает сам awg-quick
-// или ядро. Всё остальное в секции считается параметром обфускации AmneziaWG
-// и зеркалится в клиентский конфиг как есть — так поддержка новых версий
-// протокола не требует правок кода.
+// или ядро (в нижнем регистре: awg-quick сравнивает имена без учёта регистра).
+// Всё остальное в секции считается параметром обфускации AmneziaWG и зеркалится
+// в клиентский конфиг как есть — так поддержка новых версий протокола не требует
+// правок кода.
 var reservedInterfaceKeys = map[string]bool{
-	"PrivateKey": true, "ListenPort": true, "FwMark": true,
-	"Address": true, "DNS": true, "MTU": true, "Table": true,
-	"PreUp": true, "PostUp": true, "PreDown": true, "PostDown": true,
-	"SaveConfig": true,
+	"privatekey": true, "listenport": true, "fwmark": true,
+	"address": true, "dns": true, "mtu": true, "table": true,
+	"preup": true, "postup": true, "predown": true, "postdown": true,
+	"saveconfig": true,
 }
 
 // versionHasParam сообщает, существует ли в версии v параметр, появившийся в minVer.
@@ -274,11 +287,18 @@ func parseAWGVersionOutput(out string) AWGVersionInfo {
 	return info
 }
 
+// awgVersionProbeCmd опрашивает версию tools и модуля ядра за один заход.
+//
+// Завершающий `; true` обязателен: exit status пайплайна — это код grep, а без
+// модуля ядра (docker с userspace amneziawg-go) grep ничего не находит и выходит
+// с 1. SSHRun превратил бы это в ошибку и выбросил уже полученный вывод
+// `awg --version`, из-за чего версия на docker-серверах не определялась бы никогда.
+const awgVersionProbeCmd = `sh -c 'awg --version 2>/dev/null; modinfo amneziawg 2>/dev/null | grep "^version:"; true'`
+
 // detectAWGVersion опрашивает сервер ОДНОЙ командой: каждая SSH-сессия — это
 // новый Dial (SSHRunTimeout, ssh.go), лишние обходятся дорого.
 func detectAWGVersion(srv ServerConfig) (AWGVersionInfo, error) {
-	const cmd = `sh -c 'awg --version 2>/dev/null; modinfo amneziawg 2>/dev/null | grep "^version:"'`
-	out, err := execAWG(srv, cmd)
+	out, err := execAWG(srv, awgVersionProbeCmd)
 	if err != nil {
 		return AWGVersionInfo{}, fmt.Errorf("определение версии AWG: %w", err)
 	}

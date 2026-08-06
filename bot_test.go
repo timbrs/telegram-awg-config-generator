@@ -27,7 +27,7 @@ func clientWithCreator(name string, creator int64) ClientEntry {
 
 func TestFilterVisibleClientsRegularAdmin(t *testing.T) {
 	all := []ClientEntry{
-		clientWithCreator("old", 0),    // ничей (старый) — виден всем
+		clientWithCreator("old", 0), // ничей (старый) — виден всем
 		clientWithCreator("mine1", 100),
 		clientWithCreator("foreign", 200),
 		clientWithCreator("mine2", 100),
@@ -76,6 +76,39 @@ func TestFilterVisibleClientsOnlyOwn(t *testing.T) {
 	vis := filterVisibleClients(all, 100, false)
 	if len(vis) != 0 {
 		t.Errorf("у админа нет своих/ничьих ключей — ожидалось 0, получено %d", len(vis))
+	}
+}
+
+// Обычный админ не должен уметь сделать суперадмином себя: isSuperAdmin — это
+// ровно членство в report_uids, и самоповышение отключило бы модель видимости
+// ключей, которая его же и ограничивает.
+func TestCanManageReports(t *testing.T) {
+	srv := ServerConfig{
+		AllowedUIDs: []int64{100, 200, 300},
+		ReportUIDs:  []int64{200},
+	}
+
+	if !canManageReports(200, srv) {
+		t.Error("суперадмин должен управлять списком отчётов")
+	}
+	if canManageReports(100, srv) {
+		t.Error("обычный админ не должен управлять списком отчётов")
+	}
+	if canManageReports(999, srv) {
+		t.Error("посторонний не должен управлять списком отчётов")
+	}
+
+	// Бутстрап: суперадминов ещё нет — право у создателя (первый allowed_uid).
+	fresh := ServerConfig{AllowedUIDs: []int64{100, 200}}
+	if !canManageReports(100, fresh) {
+		t.Error("создатель сервера должен назначить первого суперадмина")
+	}
+	if canManageReports(200, fresh) {
+		t.Error("не-создатель не должен назначать суперадмина даже на пустом списке")
+	}
+
+	if canManageReports(100, ServerConfig{}) {
+		t.Error("сервер без админов — управлять нечем")
 	}
 }
 

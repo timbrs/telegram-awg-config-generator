@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -98,8 +99,8 @@ func TestAllocateIPGap(t *testing.T) {
 
 func TestAllocateIPDualStack(t *testing.T) {
 	clients := []ClientEntry{
-		{UserData: ClientData{AllowedIPs: "10.8.0.2/32, fd00:awg::2/128"}},
-		{UserData: ClientData{AllowedIPs: "10.8.0.3/32, fd00:awg::3/128"}},
+		{UserData: ClientData{AllowedIPs: "10.8.0.2/32, fd00:a::2/128"}},
+		{UserData: ClientData{AllowedIPs: "10.8.0.3/32, fd00:a::3/128"}},
 	}
 
 	ip, err := allocateIP(nil, clients)
@@ -157,16 +158,16 @@ func TestAllocateIPServerSubnetServerOnDotOne(t *testing.T) {
 
 func TestAllocateIPv6(t *testing.T) {
 	clients := []ClientEntry{
-		{UserData: ClientData{AllowedIPs: "10.8.0.2/32, fd00:awg::2/128"}},
-		{UserData: ClientData{AllowedIPs: "10.8.0.3/32, fd00:awg::3/128"}},
+		{UserData: ClientData{AllowedIPs: "10.8.0.2/32, fd00:a::2/128"}},
+		{UserData: ClientData{AllowedIPs: "10.8.0.3/32, fd00:a::3/128"}},
 	}
 
-	alloc, err := allocateIPv6(clients, "fd00:awg::")
+	alloc, err := allocateIPv6(clients, "fd00:a::", nil)
 	if err != nil {
 		t.Fatalf("allocateIPv6 failed: %v", err)
 	}
-	if alloc.ClientAddr != "fd00:awg::4" {
-		t.Errorf("expected fd00:awg::4, got %s", alloc.ClientAddr)
+	if alloc.ClientAddr != "fd00:a::4" {
+		t.Errorf("expected fd00:a::4, got %s", alloc.ClientAddr)
 	}
 	if alloc.AllowedMask != 128 {
 		t.Errorf("expected mask 128, got %d", alloc.AllowedMask)
@@ -174,12 +175,12 @@ func TestAllocateIPv6(t *testing.T) {
 }
 
 func TestAllocateIPv6Empty(t *testing.T) {
-	alloc, err := allocateIPv6(nil, "fd00:awg::")
+	alloc, err := allocateIPv6(nil, "fd00:a::", nil)
 	if err != nil {
 		t.Fatalf("allocateIPv6 failed: %v", err)
 	}
-	if alloc.ClientAddr != "fd00:awg::2" {
-		t.Errorf("expected fd00:awg::2, got %s", alloc.ClientAddr)
+	if alloc.ClientAddr != "fd00:a::2" {
+		t.Errorf("expected fd00:a::2, got %s", alloc.ClientAddr)
 	}
 }
 
@@ -189,7 +190,7 @@ func TestAllocateIPv6Subnet112(t *testing.T) {
 		{UserData: ClientData{AllowedIPs: "10.8.0.2/32, 2a01:db8::1:0/112"}},
 	}
 
-	alloc, err := allocateIPv6(clients, "2a01:db8::/96")
+	alloc, err := allocateIPv6(clients, "2a01:db8::/96", nil)
 	if err != nil {
 		t.Fatalf("allocateIPv6 /112 failed: %v", err)
 	}
@@ -206,7 +207,7 @@ func TestAllocateIPv6Subnet112(t *testing.T) {
 }
 
 func TestAllocateIPv6Subnet112Empty(t *testing.T) {
-	alloc, err := allocateIPv6(nil, "2a01:db8::/96")
+	alloc, err := allocateIPv6(nil, "2a01:db8::/96", nil)
 	if err != nil {
 		t.Fatalf("allocateIPv6 /112 empty failed: %v", err)
 	}
@@ -225,7 +226,7 @@ func TestAllocateIPv6CIDR(t *testing.T) {
 		{UserData: ClientData{AllowedIPs: "10.8.0.2/32, 2a01:db8::1:1/128"}},
 	}
 
-	alloc, err := allocateIPv6(clients, "2a01:db8::1:0/112")
+	alloc, err := allocateIPv6(clients, "2a01:db8::1:0/112", nil)
 	if err != nil {
 		t.Fatalf("allocateIPv6 /112 addr failed: %v", err)
 	}
@@ -336,8 +337,8 @@ func TestBuildServerConf(t *testing.T) {
 	}
 
 	// With IPv6 (same subnet = /48 or /56 case)
-	confV6 := buildServerConf("testPrivKey=", 51820, "eth0", params, "fd00:awg::1/112", "fd00:awg::1/112", AWGVersion2)
-	if !strings.Contains(confV6, "fd00:awg::1/112") {
+	confV6 := buildServerConf("testPrivKey=", 51820, "eth0", params, ulaFallbackCIDR, ulaFallbackCIDR, AWGVersion2)
+	if !strings.Contains(confV6, ulaFallbackCIDR) {
 		t.Error("IPv6 address not in config")
 	}
 	if !strings.Contains(confV6, "ip6tables") {
@@ -386,8 +387,8 @@ func TestCalculateVPNv6Subnet(t *testing.T) {
 			name:             "invalid IP falls back to ULA",
 			serverIPv6:       "invalid",
 			prefixLen:        48,
-			wantIfaceAddr:    "fd00:awg::1/112",
-			wantClientSubnet: "fd00:awg::1/112",
+			wantIfaceAddr:    ulaFallbackCIDR,
+			wantClientSubnet: ulaFallbackCIDR,
 		},
 	}
 
@@ -468,9 +469,9 @@ func TestBuildClientConfigDualStack(t *testing.T) {
 		},
 	}
 
-	conf := BuildClientConfig("clientPrivKey=", "pskKey=", "10.8.0.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", params, "fd00:awg::5")
+	conf := BuildClientConfig("clientPrivKey=", "pskKey=", "10.8.0.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", params, "fd00:a::5")
 
-	if !strings.Contains(conf, "Address = 10.8.0.5/32, fd00:awg::5/128") {
+	if !strings.Contains(conf, "Address = 10.8.0.5/32, fd00:a::5/128") {
 		t.Errorf("dual-stack address not found in config:\n%s", conf)
 	}
 	if !strings.Contains(conf, "2001:4860:4860::8888") {
@@ -708,6 +709,250 @@ PersistentKeepalive = 25
 
 	if got != want {
 		t.Errorf("клиентский конфиг разъехался с эталоном.\n--- получено ---\n%s\n--- ожидалось ---\n%s", got, want)
+	}
+}
+
+// Команда детекта версии обязана завершаться с кодом 0 даже когда ни awg, ни
+// модуля ядра нет: exit status пайплайна — это код grep, и без завершающего
+// `; true` SSHRun считал бы это ошибкой и выбрасывал вывод `awg --version`.
+// Из-за этого версия не определялась ни на одном docker-сервере.
+func TestDetectAWGVersionCommandExitsZero(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh недоступен")
+	}
+
+	// Тот же скрипт, что в detectAWGVersion, но без внешней обёртки sh -c '...'.
+	const script = `awg --version 2>/dev/null; modinfo amneziawg 2>/dev/null | grep "^version:"; true`
+	if err := exec.Command(sh, "-c", script).Run(); err != nil {
+		t.Errorf("команда детекта версии завершилась с ошибкой: %v", err)
+	}
+
+	if !strings.Contains(awgVersionProbeCmd, "; true") {
+		t.Error("в команде детекта версии потерялся завершающий `; true`")
+	}
+}
+
+func TestFirstIPv4CIDR(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"10.8.0.1/22", "10.8.0.1/22"},
+		{"10.8.0.1/22, 2a01:db8::1/64", "10.8.0.1/22"},
+		{"2a01:db8::1/64, 10.8.0.1/22", "10.8.0.1/22"},
+		{"2a01:db8::1/64", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := firstIPv4CIDR(tt.in); got != tt.want {
+			t.Errorf("firstIPv4CIDR(%q) = %q, ожидалось %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// Dual-stack строка Address не должна ронять выделение в запасной пул 10.8.0.0/22.
+func TestAllocateIPDualStackServerAddress(t *testing.T) {
+	srvParams := &ServerParams{Address: "10.9.0.1/24, 2a01:db8::1/64"}
+	ip, err := allocateIP(srvParams, nil)
+	if err != nil {
+		t.Fatalf("allocateIP failed: %v", err)
+	}
+	if ip != "10.9.0.2" {
+		t.Errorf("ожидался адрес из реальной подсети 10.9.0.0/24, получено %s", ip)
+	}
+}
+
+// При /48 и /56 пул клиентов совпадает с подсетью сервера, поэтому собственный
+// адрес интерфейса обязан считаться занятым.
+func TestAllocateIPv6SkipsServerAddress(t *testing.T) {
+	srvParams := &ServerParams{Address: "10.8.0.1/22, 2a01:db8:1234:1::1/112"}
+
+	alloc, err := allocateIPv6(nil, "2a01:db8:1234:1::1/112", srvParams)
+	if err != nil {
+		t.Fatalf("allocateIPv6 failed: %v", err)
+	}
+	if alloc.ClientAddr == "2a01:db8:1234:1::1" {
+		t.Fatal("клиенту выдан собственный IPv6-адрес сервера")
+	}
+	if alloc.ClientAddr != "2a01:db8:1234:1::2" {
+		t.Errorf("ожидался 2a01:db8:1234:1::2, получено %s", alloc.ClientAddr)
+	}
+}
+
+// IPv6 из [Peer]-секций тоже занят, даже если этих клиентов нет в clientsTable.
+func TestAllocateIPv6UsesPeerAddresses(t *testing.T) {
+	srvParams := &ServerParams{
+		PeerAllowedIPs: []string{"10.8.1.2/32, 2a01:db8::1:0/112"},
+	}
+
+	alloc, err := allocateIPv6(nil, "2a01:db8::/96", srvParams)
+	if err != nil {
+		t.Fatalf("allocateIPv6 failed: %v", err)
+	}
+	if alloc.SubnetBase != "2a01:db8::2:0" {
+		t.Errorf("подсеть из [Peer] должна считаться занятой; получено %s", alloc.SubnetBase)
+	}
+}
+
+// ULA-фолбэк обязан быть валидным IPv6: awg-quick не поднимет интерфейс с
+// невалидным адресом, а аллокатор сорвётся в строковый legacy-режим.
+func TestULAFallbackIsValidIPv6(t *testing.T) {
+	if ip := net.ParseIP(ulaFallbackAddr); ip == nil {
+		t.Fatalf("ulaFallbackAddr %q — не валидный IPv6", ulaFallbackAddr)
+	}
+	if _, _, err := net.ParseCIDR(ulaFallbackCIDR); err != nil {
+		t.Fatalf("ulaFallbackCIDR %q не парсится: %v", ulaFallbackCIDR, err)
+	}
+
+	ifaceAddr, clientSubnet, serverIP := calculateVPNv6Subnet("invalid", 48)
+	for _, s := range []string{ifaceAddr, clientSubnet} {
+		if _, _, err := net.ParseCIDR(s); err != nil {
+			t.Errorf("фолбэк вернул непарсящийся CIDR %q: %v", s, err)
+		}
+	}
+	if net.ParseIP(serverIP) == nil {
+		t.Errorf("фолбэк вернул невалидный адрес сервера %q", serverIP)
+	}
+}
+
+// Парсер awg-quick регистронезависим: служебный ключ в нестандартном регистре
+// не должен уехать в клиентский конфиг, а параметр — потеряться.
+func TestParseServerConfigCaseInsensitive(t *testing.T) {
+	conf := `[interface]
+privatekey = ` + testPrivKey + `
+address = 10.8.1.0/24
+listenport = 51820
+postup = iptables -A FORWARD -i %i -j ACCEPT
+MTU = 1420
+jc = 4
+s1 = 52
+
+[peer]
+publickey = AAA=
+allowedips = 10.8.1.2/32
+`
+	params, err := parseServerConfig(conf)
+	if err != nil {
+		t.Fatalf("parseServerConfig failed: %v", err)
+	}
+
+	if params.PrivateKey != testPrivKey || params.Address != "10.8.1.0/24" || params.ListenPort != "51820" {
+		t.Errorf("служебные поля не разобраны: %+v", params)
+	}
+	for _, bad := range []string{"postup", "PostUp", "MTU", "mtu"} {
+		if _, ok := params.AWGParams[bad]; ok {
+			t.Errorf("служебный ключ %q попал в AWGParams", bad)
+		}
+	}
+	// Известные параметры приводятся к каноническому написанию, иначе они
+	// выпали бы из clientParamOrder и не доехали бы до клиента.
+	if params.AWGParams["Jc"] != "4" || params.AWGParams["S1"] != "52" {
+		t.Errorf("параметры не приведены к каноническому виду: %v", params.AWGParams)
+	}
+	if len(params.ExtraParamOrder) != 0 {
+		t.Errorf("известные параметры не должны считаться неизвестными: %v", params.ExtraParamOrder)
+	}
+	if len(params.Peers) != 1 || params.Peers[0].PublicKey != "AAA=" {
+		t.Errorf("секция [peer] не разобрана: %+v", params.Peers)
+	}
+
+	conf2 := BuildClientConfig("priv=", "psk=", "10.8.1.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", params)
+	if strings.Contains(strings.ToLower(conf2), "postup") {
+		t.Errorf("PostUp просочился в клиентский конфиг:\n%s", conf2)
+	}
+	if !strings.Contains(conf2, "Jc = 4") {
+		t.Errorf("параметр Jc потерялся в клиентском конфиге:\n%s", conf2)
+	}
+}
+
+// IPv6-адрес в Endpoint обязан быть в квадратных скобках.
+func TestBuildClientConfigIPv6Endpoint(t *testing.T) {
+	params := &ServerParams{PublicKey: "srv=", AWGParams: map[string]string{"Jc": "4"}}
+
+	conf := BuildClientConfig("priv=", "psk=", "10.8.1.5", "2a01:db8::1", "51820", "8.8.8.8", "8.8.4.4", params)
+	if !strings.Contains(conf, "Endpoint = [2a01:db8::1]:51820") {
+		t.Errorf("IPv6-endpoint без скобок:\n%s", conf)
+	}
+
+	conf4 := BuildClientConfig("priv=", "psk=", "10.8.1.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", params)
+	if !strings.Contains(conf4, "Endpoint = 1.2.3.4:51820") {
+		t.Errorf("IPv4-endpoint изменился:\n%s", conf4)
+	}
+}
+
+// Конфиг внутри vpn:// должен нести те же адреса, что и выданный .conf.
+func TestBuildAmneziaVPNURIIncludesClientIPv6(t *testing.T) {
+	params := v3Params()
+
+	uri, _, err := BuildAmneziaVPNURI("priv=", "pub=", "psk=", "10.8.1.5", "1.2.3.4", "51820", "S", "8.8.8.8", "8.8.4.4", params, "2a01:db8::1:1", "112")
+	if err != nil {
+		t.Fatalf("BuildAmneziaVPNURI failed: %v", err)
+	}
+
+	cfg := decodeVPNURI(t, uri)
+	var lc map[string]interface{}
+	if err := json.Unmarshal([]byte(cfg.Containers[0].AWG.LastConfig), &lc); err != nil {
+		t.Fatalf("last_config is not valid JSON: %v", err)
+	}
+	configStr, _ := lc["config"].(string)
+	if !strings.Contains(configStr, "Address = 10.8.1.5/32, 2a01:db8::1:1/112") {
+		t.Errorf("IPv6 клиента не попал в конфиг внутри URI:\n%s", configStr)
+	}
+}
+
+// Прежняя структура объявляла I1-I5 без omitempty, поэтому они присутствовали
+// всегда. Для серверов AWG 1.0 их нельзя терять при переходе на map.
+func TestBuildAmneziaVPNURIAlwaysHasIKeys(t *testing.T) {
+	v1 := &ServerParams{
+		PublicKey:  "serverPubKey=",
+		ListenPort: "51820",
+		AWGParams: map[string]string{
+			"Jc": "4", "Jmin": "40", "Jmax": "70", "S1": "52", "S2": "27",
+			"H1": "1", "H2": "2", "H3": "3", "H4": "4",
+		},
+	}
+
+	uri, _, err := BuildAmneziaVPNURI("priv=", "pub=", "psk=", "10.8.1.5", "1.2.3.4", "51820", "S", "8.8.8.8", "8.8.4.4", v1)
+	if err != nil {
+		t.Fatalf("BuildAmneziaVPNURI failed: %v", err)
+	}
+
+	cfg := decodeVPNURI(t, uri)
+	if cfg.DefaultContainer != "amnezia-awg" {
+		t.Errorf("для 1.0 ожидался контейнер amnezia-awg, получено %s", cfg.DefaultContainer)
+	}
+	awg := cfg.Containers[0].AWG
+	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if _, ok := awg.Params[k]; !ok {
+			t.Errorf("ключ %s пропал из контейнера awg", k)
+		}
+	}
+	// В сам конфиг пустые I1-I5 при этом попадать не должны — awg-quick на них падает.
+	var lc map[string]interface{}
+	if err := json.Unmarshal([]byte(awg.LastConfig), &lc); err != nil {
+		t.Fatalf("last_config is not valid JSON: %v", err)
+	}
+	if configStr, _ := lc["config"].(string); strings.Contains(configStr, "I1 = \n") {
+		t.Errorf("пустой I1 попал в текст конфига:\n%s", configStr)
+	}
+}
+
+// Откат вправе удалять директорию конфигов только если создал её сам.
+func TestConfDirPreexisted(t *testing.T) {
+	created := &InstallLog{Steps: []InstallStep{
+		{StepName: "Create config directory", Output: "", Success: true},
+	}}
+	if confDirPreexisted(created) {
+		t.Error("директории не было — откат должен её удалять")
+	}
+
+	existed := &InstallLog{Steps: []InstallStep{
+		{StepName: "Create config directory", Output: confDirExistedMarker + "\n", Success: true},
+	}}
+	if !confDirPreexisted(existed) {
+		t.Error("директория существовала до установки — удалять её нельзя")
+	}
+
+	if confDirPreexisted(&InstallLog{}) {
+		t.Error("пустой лог не должен считаться признаком существующей директории")
 	}
 }
 
@@ -1026,7 +1271,7 @@ func TestListClientsFromPeers(t *testing.T) {
 	peers := []PeerBlock{
 		{PublicKey: "AAA=", AllowedIPs: "10.8.1.2/32"},
 		{PublicKey: "", AllowedIPs: "10.8.1.9/32"}, // битый блок — пропускаем
-		{PublicKey: "BBB=", AllowedIPs: "10.8.1.3/32, fd00:awg::3/128"},
+		{PublicKey: "BBB=", AllowedIPs: "10.8.1.3/32, fd00:a::3/128"},
 	}
 
 	clients := buildClientsFromPeers(peers)
@@ -1039,7 +1284,7 @@ func TestListClientsFromPeers(t *testing.T) {
 	if clients[1].UserData.ClientName != "peer-2" || clients[1].ID != 2 {
 		t.Errorf("нумерация сбилась на битом блоке: %+v", clients[1])
 	}
-	if clients[1].UserData.AllowedIPs != "10.8.1.3/32, fd00:awg::3/128" {
+	if clients[1].UserData.AllowedIPs != "10.8.1.3/32, fd00:a::3/128" {
 		t.Errorf("AllowedIPs потерялись: %q", clients[1].UserData.AllowedIPs)
 	}
 	for _, c := range clients {

@@ -112,10 +112,30 @@ func (cm *ConfigManager) CheckReload() error {
 	return nil
 }
 
+// Get возвращает НЕЗАВИСИМУЮ копию конфига.
+//
+// Копировать обязательно: AppConfig копируется по значению, но срез Servers
+// продолжал бы указывать на тот же backing array, а мутаторы (SetAWGInfo,
+// RenameServer, AddAllowedUID, …) правят его элементы на месте. Вызывающие
+// держат сервер по указателю (resolveServer) и читают его без блокировки —
+// это была гонка на заголовках строк, вплоть до порванного имени интерфейса
+// в команде `awg show`.
 func (cm *ConfigManager) Get() AppConfig {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	return cm.config
+	return cm.config.clone()
+}
+
+// clone делает глубокую копию изменяемых частей конфига.
+func (c AppConfig) clone() AppConfig {
+	out := c
+	out.Servers = make([]ServerConfig, len(c.Servers))
+	copy(out.Servers, c.Servers)
+	for i := range out.Servers {
+		out.Servers[i].AllowedUIDs = append([]int64(nil), c.Servers[i].AllowedUIDs...)
+		out.Servers[i].ReportUIDs = append([]int64(nil), c.Servers[i].ReportUIDs...)
+	}
+	return out
 }
 
 func (cm *ConfigManager) UpdateLastConnected(serverIdx int) error {

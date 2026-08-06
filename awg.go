@@ -354,15 +354,19 @@ func parseServerConfig(output string) (*ServerParams, error) {
 		curPeer = nil
 	}
 
+	// Имена секций и ключей сравниваем без учёта регистра: парсер awg-quick
+	// разбирает конфиг с `shopt -s nocasematch`, поэтому `postup = ...` для него
+	// служебный ключ. При blacklist-подходе регистрозависимое сравнение приняло
+	// бы такую строку за параметр обфускации и скопировало бы её клиенту.
 	section := ""
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "[Interface]" {
+		switch strings.ToLower(line) {
+		case "[interface]":
 			flushPeer()
 			section = "interface"
 			continue
-		}
-		if line == "[Peer]" {
+		case "[peer]":
 			flushPeer()
 			section = "peer"
 			curPeer = &PeerBlock{}
@@ -377,40 +381,47 @@ func parseServerConfig(output string) (*ServerParams, error) {
 		}
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
+		lkey := strings.ToLower(key)
 
 		switch section {
 		case "interface":
-			switch key {
-			case "PrivateKey":
+			switch lkey {
+			case "privatekey":
 				params.PrivateKey = val
-			case "Address":
+			case "address":
 				params.Address = val
-			case "ListenPort":
+			case "listenport":
 				params.ListenPort = val
-			case "DNS":
+			case "dns":
 				params.DNS = val
 			default:
-				if reservedInterfaceKeys[key] {
+				if reservedInterfaceKeys[lkey] {
 					continue
 				}
-				if _, dup := params.AWGParams[key]; !dup {
-					if _, known := awgParamMinVer[key]; !known {
-						// Параметр из версии протокола, которой бот ещё не знает.
-						// Зеркалим его всё равно — но пусть будет виден в журнале.
-						log.Printf("AWG: неизвестный параметр %q в [Interface] — копирую в клиентский конфиг как есть", key)
-						params.ExtraParamOrder = append(params.ExtraParamOrder, key)
-					}
+				// Известные параметры кладём под каноническим именем из
+				// awgParamSpecs — иначе `jc = 4` не нашёлся бы в clientParamOrder
+				// и молча выпал бы из клиентского конфига. Незнакомые сохраняют
+				// написание сервера.
+				name, known := awgParamCanonical[lkey]
+				if !known {
+					name = key
 				}
-				params.AWGParams[key] = val
+				if _, dup := params.AWGParams[name]; !dup && !known {
+					// Параметр из версии протокола, которой бот ещё не знает.
+					// Зеркалим его всё равно — но пусть будет виден в журнале.
+					log.Printf("AWG: неизвестный параметр %q в [Interface] — копирую в клиентский конфиг как есть", key)
+					params.ExtraParamOrder = append(params.ExtraParamOrder, name)
+				}
+				params.AWGParams[name] = val
 			}
 		case "peer":
 			if curPeer == nil {
 				continue
 			}
-			switch key {
-			case "PublicKey":
+			switch lkey {
+			case "publickey":
 				curPeer.PublicKey = val
-			case "AllowedIPs":
+			case "allowedips":
 				curPeer.AllowedIPs = val
 			}
 		}
@@ -486,12 +497,12 @@ func allocateIP(srvParams *ServerParams, clients []ClientEntry) (string, error) 
 		}
 	}
 	for _, c := range clients {
-		markUsed(c.UserData.AllowedIPs) // dual-stack: "10.8.0.5/32, fd00:awg::5/128"
+		markUsed(c.UserData.AllowedIPs) // dual-stack: "10.8.0.5/32, fd00:a::5/128"
 	}
 
 	// Выделение в реальной подсети сервера.
 	if srvParams != nil && srvParams.Address != "" {
-		serverIP, ipnet, err := net.ParseCIDR(srvParams.Address)
+		serverIP, ipnet, err := net.ParseCIDR(firstIPv4CIDR(srvParams.Address))
 		if err == nil && serverIP.To4() != nil {
 			used[serverIP.To4().String()] = true // адрес сервера не выдаём
 			if ip, ok := firstFreeIPv4(ipnet, used); ok {
@@ -515,6 +526,21 @@ func allocateIP(srvParams *ServerParams, clients []ClientEntry) (string, error) 
 		}
 	}
 	return "", fmt.Errorf("нет свободных IP-адресов (лимит 1021)")
+}
+
+// firstIPv4CIDR выбирает IPv4-часть строки Address, которая может быть
+// dual-stack: "10.8.0.1/22, 2a01:db8::1/64" — именно так её пишет buildServerConf
+// при включённом IPv6. Без этого net.ParseCIDR падает на всей строке, и
+// выделение адреса молча срывается в запасной пул 10.8.0.0/22.
+func firstIPv4CIDR(addr string) string {
+	for _, part := range strings.Split(addr, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.Contains(part, ":") {
+			continue
+		}
+		return part
+	}
+	return ""
 }
 
 // firstFreeIPv4 возвращает первый свободный адрес-хост в IPv4-подсети, пропуская
@@ -550,28 +576,57 @@ type IPv6AllocResult struct {
 	SubnetBase string
 }
 
+// ipv6Used — множество занятых IPv6-адресов: канонические строки (net.IP.String)
+// для CIDR-режимов и сырые нижнерегистровые для legacy-режима, который сравнивает
+// адреса как строки.
+type ipv6Used struct {
+	canonical map[string]bool
+	raw       map[string]bool
+}
+
+func (u ipv6Used) mark(list string) {
+	for _, part := range strings.Split(list, ",") {
+		part = strings.TrimSpace(part)
+		if !strings.Contains(part, ":") {
+			continue
+		}
+		raw := strings.Split(part, "/")[0]
+		u.raw[strings.ToLower(raw)] = true
+		if ip := net.ParseIP(raw); ip != nil {
+			u.canonical[ip.String()] = true
+		}
+	}
+}
+
+// collectUsedIPv6 собирает занятые IPv6 из clientsTable, из реальных
+// [Peer]-секций конфига и из адреса самого AWG-интерфейса.
+//
+// Пиры нужны по той же причине, что и для IPv4: клиенты, созданные приложением
+// Amnezia или вручную, в clientsTable могут отсутствовать. Адрес интерфейса —
+// потому что при /48 и /56 пул клиентов совпадает с подсетью сервера, и без
+// этого первый же клиент получал бы собственный адрес сервера.
+func collectUsedIPv6(clients []ClientEntry, srvParams *ServerParams) ipv6Used {
+	used := ipv6Used{canonical: map[string]bool{}, raw: map[string]bool{}}
+	for _, c := range clients {
+		used.mark(c.UserData.AllowedIPs)
+	}
+	if srvParams != nil {
+		for _, p := range srvParams.PeerAllowedIPs {
+			used.mark(p)
+		}
+		used.mark(srvParams.Address)
+	}
+	return used
+}
+
 // allocateIPv6 allocates the next free IPv6 address or subnet from a pool.
 //
 // Modes based on CIDR prefix length:
 //   - /96: allocate /112 subnets (each client gets prefix::N:0/112, addr prefix::N:1)
 //   - /112 or larger: allocate individual addresses within the CIDR
 //   - bare prefix (no /): legacy string-based allocation
-func allocateIPv6(clients []ClientEntry, subnetCIDR string) (*IPv6AllocResult, error) {
-	// Build set of used IPv6 addresses/subnets (canonical form)
-	usedCanonical := make(map[string]bool)
-	usedRaw := make(map[string]bool)
-	for _, c := range clients {
-		for _, part := range strings.Split(c.UserData.AllowedIPs, ",") {
-			part = strings.TrimSpace(part)
-			if strings.Contains(part, ":") {
-				raw := strings.Split(part, "/")[0]
-				usedRaw[strings.ToLower(raw)] = true
-				if ip := net.ParseIP(raw); ip != nil {
-					usedCanonical[ip.String()] = true
-				}
-			}
-		}
-	}
+func allocateIPv6(clients []ClientEntry, subnetCIDR string, srvParams *ServerParams) (*IPv6AllocResult, error) {
+	used := collectUsedIPv6(clients, srvParams)
 
 	// Try CIDR parsing
 	if strings.Contains(subnetCIDR, "/") {
@@ -581,16 +636,16 @@ func allocateIPv6(clients []ClientEntry, subnetCIDR string) (*IPv6AllocResult, e
 
 			// /96 pool → allocate /112 subnets per client
 			if ones <= 96 {
-				return allocateIPv6Subnet112(ipNet, usedCanonical)
+				return allocateIPv6Subnet112(ipNet, used.canonical)
 			}
 
 			// /112 or tighter → allocate individual addresses
-			return allocateIPv6Address(ipNet, usedCanonical, subnetCIDR)
+			return allocateIPv6Address(ipNet, used.canonical, subnetCIDR)
 		}
 	}
 
-	// Fallback: bare prefix like "fd00:awg::"
-	return allocateIPv6Legacy(clients, subnetCIDR)
+	// Fallback: bare prefix like "fd00:a::"
+	return allocateIPv6Legacy(used, subnetCIDR)
 }
 
 // allocateIPv6Subnet112 allocates /112 subnets from a /96 pool.
@@ -654,8 +709,8 @@ func allocateIPv6Address(ipNet *net.IPNet, used map[string]bool, cidr string) (*
 	return nil, fmt.Errorf("нет свободных IPv6-адресов в %s", cidr)
 }
 
-// allocateIPv6Legacy handles bare prefix strings like "fd00:awg::".
-func allocateIPv6Legacy(clients []ClientEntry, subnetCIDR string) (*IPv6AllocResult, error) {
+// allocateIPv6Legacy handles bare prefix strings like "fd00:a::".
+func allocateIPv6Legacy(used ipv6Used, subnetCIDR string) (*IPv6AllocResult, error) {
 	vpnPrefix := strings.TrimSuffix(subnetCIDR, "::")
 	if !strings.HasSuffix(vpnPrefix, ":") {
 		vpnPrefix += "::"
@@ -663,20 +718,9 @@ func allocateIPv6Legacy(clients []ClientEntry, subnetCIDR string) (*IPv6AllocRes
 		vpnPrefix += ":"
 	}
 
-	usedRaw := make(map[string]bool)
-	for _, c := range clients {
-		for _, part := range strings.Split(c.UserData.AllowedIPs, ",") {
-			part = strings.TrimSpace(part)
-			if strings.Contains(part, ":") {
-				raw := strings.Split(part, "/")[0]
-				usedRaw[strings.ToLower(raw)] = true
-			}
-		}
-	}
-
 	for i := 2; i <= 0xFFFE; i++ {
 		ip := fmt.Sprintf("%s%x", vpnPrefix, i)
-		if !usedRaw[strings.ToLower(ip)] {
+		if !used.raw[strings.ToLower(ip)] {
 			return &IPv6AllocResult{
 				ClientAddr:  ip,
 				AllowedMask: 128,
@@ -723,7 +767,7 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 	clientIPv6Mask := "128"
 	allowedIPs := newIP + "/32"
 	if srv.IPv6Subnet != "" {
-		alloc, ipv6Err := allocateIPv6(clients, srv.IPv6Subnet)
+		alloc, ipv6Err := allocateIPv6(clients, srv.IPv6Subnet, srvParams)
 		if ipv6Err != nil {
 			log.Printf("IPv6 allocation failed: %v", ipv6Err)
 		} else {
@@ -774,7 +818,7 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 	clientConf = BuildClientConfig(privKey, psk, newIP, endpointHost, srvParams.ListenPort, dns1, dns2, srvParams, clientIPv6, clientIPv6Mask)
 
 	// Build AmneziaVPN URI (non-fatal on error)
-	vpnURI, _, vpnErr := BuildAmneziaVPNURI(privKey, pubKey, psk, newIP, endpointHost, srvParams.ListenPort, srv.Name, dns1, dns2, srvParams)
+	vpnURI, _, vpnErr := BuildAmneziaVPNURI(privKey, pubKey, psk, newIP, endpointHost, srvParams.ListenPort, srv.Name, dns1, dns2, srvParams, clientIPv6, clientIPv6Mask)
 	if vpnErr != nil {
 		log.Printf("AmneziaVPN URI build failed: %v", vpnErr)
 	}
@@ -1041,7 +1085,9 @@ func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2 
 	sb.WriteString("\n[Peer]\n")
 	sb.WriteString(fmt.Sprintf("PublicKey = %s\n", params.PublicKey))
 	sb.WriteString(fmt.Sprintf("PresharedKey = %s\n", psk))
-	sb.WriteString(fmt.Sprintf("Endpoint = %s:%s\n", serverIP, serverPort))
+	// JoinHostPort оборачивает IPv6-адрес в квадратные скобки; без этого
+	// "Endpoint = 2a01:db8::1:51820" неразличим с адресом без порта.
+	sb.WriteString(fmt.Sprintf("Endpoint = %s\n", net.JoinHostPort(serverIP, serverPort)))
 	sb.WriteString("AllowedIPs = 0.0.0.0/0, ::/0\n")
 	sb.WriteString("PersistentKeepalive = 25\n")
 
@@ -1131,7 +1177,10 @@ func (a *amneziaAWGData) UnmarshalJSON(data []byte) error {
 }
 
 // BuildAmneziaVPNURI builds a vpn:// URI for AmneziaVPN app.
-func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, serverName, dns1, dns2 string, params *ServerParams) (vpnURI string, compressedData []byte, err error) {
+// clientIPv6 (address, prefix length) — те же необязательные аргументы, что у
+// BuildClientConfig: без них конфиг внутри vpn:// вышел бы IPv4-only, хотя
+// allowed_ips в нём заявляет ::/0.
+func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, serverName, dns1, dns2 string, params *ServerParams, clientIPv6 ...string) (vpnURI string, compressedData []byte, err error) {
 	// Работаем с КОПИЕЙ параметров: дописывать I1-I5 прямо в params.AWGParams
 	// нельзя — это данные вызывающей стороны, и пустой "I1 = " в клиентском
 	// .conf роняет awg-quick. Раньше от этого спасал лишь порядок вызовов в
@@ -1163,7 +1212,7 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 	}
 
 	// Build the full WG+AWG config text
-	confText := BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2, local)
+	confText := BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2, local, clientIPv6...)
 
 	// Parse port as integer for last_config (AmneziaVPN expects number)
 	portNum, _ := strconv.Atoi(serverPort)
@@ -1209,6 +1258,14 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 	}
 	for _, key := range clientParamOrder(local) {
 		awgData.Params[key] = local.AWGParams[key]
+	}
+	// Ключи I1-I5 приложение AmneziaVPN ожидает в контейнере всегда, даже
+	// пустыми: прежняя структура объявляла их без omitempty, и для серверов
+	// AWG 1.0 (где local их не содержит) они иначе исчезли бы из JSON.
+	for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
+		if _, ok := awgData.Params[k]; !ok {
+			awgData.Params[k] = ""
+		}
 	}
 
 	cfg := amneziaVPNConfig{

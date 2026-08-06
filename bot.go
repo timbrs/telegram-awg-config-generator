@@ -41,7 +41,14 @@ const (
 )
 
 // UserSession tracks the current UI state for a user.
+//
+// Обработчики telebot для одного пользователя выполняются последовательно, но
+// установка AWG работает в отдельной горутине минутами и всё это время читает и
+// пишет ту же сессию. Поэтому поля, которые видят обе стороны (Screen, MessageID,
+// ChatID и Pending*-результаты установки), закрыты mu; b.mu защищает только карту
+// сессий и здесь не помогает.
 type UserSession struct {
+	mu                sync.Mutex
 	Screen            Screen
 	MessageID         int // ID of the "menu message" we keep editing
 	ChatID            int64
@@ -67,6 +74,50 @@ type UserSession struct {
 	PendingIPv6Subnet    string // computed VPN IPv6 client subnet CIDR
 	PendingIPv6IfaceAddr string // computed AWG interface IPv6 address
 	PendingNetIface      string // detected network interface
+}
+
+func (s *UserSession) screen() Screen {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Screen
+}
+
+func (s *UserSession) setScreen(v Screen) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Screen = v
+}
+
+func (s *UserSession) messageID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.MessageID
+}
+
+func (s *UserSession) setMessageID(v int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.MessageID = v
+}
+
+func (s *UserSession) chatID() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ChatID
+}
+
+func (s *UserSession) setChatID(v int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ChatID = v
+}
+
+// withLock выполняет f под мьютексом сессии — для групп полей, которые нужно
+// прочитать или записать согласованно (результаты установки AWG).
+func (s *UserSession) withLock(f func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f()
 }
 
 const clientsPerPage = 30
@@ -141,7 +192,7 @@ func (b *Bot) getSession(uid, chatID int64) *UserSession {
 		s = &UserSession{ChatID: chatID}
 		b.sessions[uid] = s
 	}
-	s.ChatID = chatID
+	s.setChatID(chatID)
 	return s
 }
 
@@ -213,8 +264,8 @@ func (b *Bot) Start() {
 
 // editOrSend tries to edit the session's menu message; falls back to sending a new one.
 func (b *Bot) editOrSend(s *UserSession, bot *tele.Bot, text string, markup *tele.ReplyMarkup) error {
-	if s.MessageID != 0 {
-		msg := &tele.Message{ID: s.MessageID, Chat: &tele.Chat{ID: s.ChatID}}
+	if s.messageID() != 0 {
+		msg := &tele.Message{ID: s.messageID(), Chat: &tele.Chat{ID: s.chatID()}}
 		var err error
 		if markup != nil {
 			_, err = bot.Edit(msg, text, markup)
@@ -224,27 +275,27 @@ func (b *Bot) editOrSend(s *UserSession, bot *tele.Bot, text string, markup *tel
 		if err == nil || strings.Contains(err.Error(), "message is not modified") {
 			return nil
 		}
-		log.Printf("Edit failed (msg %d): %v", s.MessageID, err)
+		log.Printf("Edit failed (msg %d): %v", s.messageID(), err)
 	}
 
 	var sent *tele.Message
 	var err error
 	if markup != nil {
-		sent, err = bot.Send(&tele.Chat{ID: s.ChatID}, text, markup)
+		sent, err = bot.Send(&tele.Chat{ID: s.chatID()}, text, markup)
 	} else {
-		sent, err = bot.Send(&tele.Chat{ID: s.ChatID}, text)
+		sent, err = bot.Send(&tele.Chat{ID: s.chatID()}, text)
 	}
 	if err != nil {
 		return err
 	}
-	s.MessageID = sent.ID
+	s.setMessageID(sent.ID)
 	return nil
 }
 
 // syncMessageID updates session's MessageID from callback context.
 func syncMessageID(s *UserSession, c tele.Context) {
 	if cb := c.Callback(); cb != nil && cb.Message != nil {
-		s.MessageID = cb.Message.ID
+		s.setMessageID(cb.Message.ID)
 	}
 }
 
@@ -255,7 +306,7 @@ func (b *Bot) showMainMenu(s *UserSession, bot *tele.Bot, uid int64) error {
 }
 
 func (b *Bot) showMainMenuWithHeader(s *UserSession, bot *tele.Bot, uid int64, header string) error {
-	s.Screen = ScreenMain
+	s.setScreen(ScreenMain)
 
 	cfg := b.cfg.Get()
 	indices := b.cfg.ServersForUser(uid)
@@ -295,7 +346,7 @@ func (b *Bot) showMainMenuWithHeader(s *UserSession, bot *tele.Bot, uid int64, h
 
 // showLoading updates only the inline keyboard, adding ⏳ to the pressed button.
 func (b *Bot) showLoading(s *UserSession, bot *tele.Bot, uid int64, loadingBtn string) {
-	if s.MessageID == 0 {
+	if s.messageID() == 0 {
 		return
 	}
 
@@ -323,13 +374,13 @@ func (b *Bot) showLoading(s *UserSession, bot *tele.Bot, uid int64, loadingBtn s
 	}
 	markup.Inline(rows...)
 
-	msg := &tele.Message{ID: s.MessageID, Chat: &tele.Chat{ID: s.ChatID}}
+	msg := &tele.Message{ID: s.messageID(), Chat: &tele.Chat{ID: s.chatID()}}
 	_, _ = bot.EditReplyMarkup(msg, markup)
 }
 
 // showStatusLoading shows hourglass on the Refresh button while data is loading.
 func (b *Bot) showStatusLoading(s *UserSession, bot *tele.Bot) {
-	if s.MessageID == 0 {
+	if s.messageID() == 0 {
 		return
 	}
 	markup := &tele.ReplyMarkup{}
@@ -337,7 +388,7 @@ func (b *Bot) showStatusLoading(s *UserSession, bot *tele.Bot) {
 		markup.Data("⏳ Обновить", btnRefresh.Unique),
 		markup.Data("↩ Меню", btnMenu.Unique),
 	})
-	msg := &tele.Message{ID: s.MessageID, Chat: &tele.Chat{ID: s.ChatID}}
+	msg := &tele.Message{ID: s.messageID(), Chat: &tele.Chat{ID: s.chatID()}}
 	_, _ = bot.EditReplyMarkup(msg, markup)
 }
 
@@ -422,7 +473,7 @@ func invalidNumberMsg(page []ClientEntry, num int) string {
 }
 
 func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig, uid int64) error {
-	s.Screen = ScreenStatus
+	s.setScreen(ScreenStatus)
 
 	clients, err := b.listVisibleClients(srv, uid)
 	if err != nil {
@@ -487,7 +538,7 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig, uid in
 }
 
 func (b *Bot) showNewPrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
-	s.Screen = ScreenNewPrompt
+	s.setScreen(ScreenNewPrompt)
 	text := fmt.Sprintf("📝 Новый ключ на сервере %s\nВведите имя ключа:", srv.Name)
 
 	markup := &tele.ReplyMarkup{}
@@ -497,7 +548,7 @@ func (b *Bot) showNewPrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) err
 }
 
 func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig, uid int64) error {
-	s.Screen = ScreenDeletePrompt
+	s.setScreen(ScreenDeletePrompt)
 
 	clients, err := b.listVisibleClients(srv, uid)
 	if err != nil {
@@ -536,7 +587,7 @@ func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig, 
 }
 
 func (b *Bot) showRenamePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig, uid int64) error {
-	s.Screen = ScreenRenamePrompt
+	s.setScreen(ScreenRenamePrompt)
 
 	clients, err := b.listVisibleClients(srv, uid)
 	if err != nil {
@@ -566,7 +617,7 @@ func (b *Bot) showRenamePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig, 
 }
 
 func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
-	s.Screen = ScreenServerList
+	s.setScreen(ScreenServerList)
 
 	indices := b.cfg.ServersForUser(uid)
 	cfg := b.cfg.Get()
@@ -576,8 +627,14 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
 
+	// CLAUDE.md: отказ, если у пользователя 0 доступных серверов, с указанием его
+	// UID. Исключение — пустой config.yaml: иначе первый сервер добавить нечем.
+	if len(indices) == 0 && len(cfg.Servers) > 0 {
+		return b.showError(s, bot, fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d\n\nПопросите админа добавить вас.", uid))
+	}
+
 	if len(indices) == 0 {
-		// No servers — show only add button
+		// Пустой конфиг — режим первоначальной настройки, есть только «Добавить».
 	} else {
 		for i, idx := range indices {
 			srv := cfg.Servers[idx]
@@ -706,7 +763,7 @@ func (b *Bot) showError(s *UserSession, bot *tele.Bot, text string) error {
 func (b *Bot) cmdStart(c tele.Context) error {
 	uid := c.Sender().ID
 	s := b.getSession(uid, c.Chat().ID)
-	s.MessageID = 0 // force new message on /start
+	s.setMessageID(0) // force new message on /start
 	return b.showMainMenu(s, c.Bot(), uid)
 }
 
@@ -864,7 +921,7 @@ func (b *Bot) redrawCurrentScreen(s *UserSession, bot *tele.Bot, uid int64) erro
 	if err != nil {
 		return b.showError(s, bot, err.Error())
 	}
-	switch s.Screen {
+	switch s.screen() {
 	case ScreenStatus:
 		return b.showStatus(s, bot, *srv, uid)
 	case ScreenDeletePrompt:
@@ -885,7 +942,7 @@ func (b *Bot) cbServerRename(c tele.Context) error {
 }
 
 func (b *Bot) showServerRenameList(s *UserSession, bot *tele.Bot, uid int64) error {
-	s.Screen = ScreenServerRenamePrompt
+	s.setScreen(ScreenServerRenamePrompt)
 
 	indices := b.cfg.ServersForUser(uid)
 	cfg := b.cfg.Get()
@@ -924,7 +981,7 @@ func (b *Bot) cbServerRenameSelect(c tele.Context) error {
 	cfg := b.cfg.Get()
 	srv := cfg.Servers[serverIdx]
 
-	s.Screen = ScreenServerRenamePending
+	s.setScreen(ScreenServerRenamePending)
 	s.PendingServerIdx = serverIdx
 
 	text := fmt.Sprintf("✏️ Переименование сервера: %s (%s)\nВведите новое имя:", srv.Name, srv.IP)
@@ -946,7 +1003,7 @@ func (b *Bot) onText(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	text := strings.TrimSpace(c.Message().Text)
 
-	switch s.Screen {
+	switch s.screen() {
 	case ScreenNewPrompt:
 		return b.handleNewCreate(c, s, text)
 	case ScreenDeletePrompt:
@@ -1044,7 +1101,7 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 	}
 
 	// Show main menu with success header
-	s.MessageID = 0 // force new message for menu
+	s.setMessageID(0) // force new message for menu
 	return b.showMainMenuWithHeader(s, c.Bot(), uid, fmt.Sprintf("✅ Ключ \"%s\" создан на сервере %s", name, srv.Name))
 }
 
@@ -1106,7 +1163,7 @@ func (b *Bot) handleRenameSelectNumber(c tele.Context, s *UserSession, input str
 		return b.showError(s, c.Bot(), invalidNumberMsg(page, num))
 	}
 
-	s.Screen = ScreenRenamePending
+	s.setScreen(ScreenRenamePending)
 	s.PendingClientID = target.ClientID
 	s.PendingClientName = target.UserData.ClientName
 	s.PendingUserMsgIDs = []int{c.Message().ID}
@@ -1126,7 +1183,7 @@ func (b *Bot) handleRenameExecute(c tele.Context, s *UserSession, input string) 
 	// Collect second user message and delete both
 	s.PendingUserMsgIDs = append(s.PendingUserMsgIDs, c.Message().ID)
 	for _, msgID := range s.PendingUserMsgIDs {
-		_ = c.Bot().Delete(&tele.Message{ID: msgID, Chat: &tele.Chat{ID: s.ChatID}})
+		_ = c.Bot().Delete(&tele.Message{ID: msgID, Chat: &tele.Chat{ID: s.chatID()}})
 	}
 	s.PendingUserMsgIDs = nil
 
@@ -1156,7 +1213,7 @@ func (b *Bot) handleServerRenameExecute(c tele.Context, s *UserSession, input st
 	}
 
 	uid := c.Sender().ID
-	s.Screen = ScreenServerList
+	s.setScreen(ScreenServerList)
 	return b.showServerList(s, c.Bot(), uid)
 }
 
@@ -1168,7 +1225,13 @@ func (b *Bot) cbAddServer(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 
-	s.Screen = ScreenAddServerIP
+	// Добавлять серверы вправе только тот, у кого уже есть доступ хоть к одному
+	// (либо кто угодно, пока конфиг пуст — первоначальная настройка).
+	if len(b.cfg.ServersForUser(uid)) == 0 && len(b.cfg.Get().Servers) > 0 {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d\n\nПопросите админа добавить вас.", uid))
+	}
+
+	s.setScreen(ScreenAddServerIP)
 	s.PendingServerIP = ""
 	s.PendingServerLogin = ""
 	s.PendingServerPass = ""
@@ -1176,6 +1239,13 @@ func (b *Bot) cbAddServer(c tele.Context) error {
 	s.PendingServerDir = ""
 	s.PendingServerIface = ""
 	s.PendingServerVer = AWGVersionInfo{}
+	// Поля install-визарда тоже сбрасываем: иначе ipv6_subnet, net_iface и порт
+	// от предыдущей установки попадут в конфиг следующего добавленного сервера.
+	s.PendingInstallPort = 0
+	s.PendingInstallIPv6 = false
+	s.PendingIPv6Subnet = ""
+	s.PendingIPv6IfaceAddr = ""
+	s.PendingNetIface = ""
 
 	text := "🖥 Новый сервер\nВведите IP-адрес:"
 	markup := &tele.ReplyMarkup{}
@@ -1190,7 +1260,7 @@ func (b *Bot) handleAddServerIP(c tele.Context, s *UserSession, input string) er
 	}
 
 	s.PendingServerIP = ip
-	s.Screen = ScreenAddServerLogin
+	s.setScreen(ScreenAddServerLogin)
 
 	text := fmt.Sprintf("🖥 Новый сервер: %s\nВведите логин (SSH):", ip)
 	markup := &tele.ReplyMarkup{}
@@ -1205,7 +1275,7 @@ func (b *Bot) handleAddServerLogin(c tele.Context, s *UserSession, input string)
 	}
 
 	s.PendingServerLogin = login
-	s.Screen = ScreenAddServerPass
+	s.setScreen(ScreenAddServerPass)
 
 	text := fmt.Sprintf("🖥 Новый сервер: %s@%s\nВведите пароль (SSH):", login, s.PendingServerIP)
 	markup := &tele.ReplyMarkup{}
@@ -1237,7 +1307,7 @@ func (b *Bot) handleAddServerPass(c tele.Context, s *UserSession, input string) 
 	det, err := detectAWGMode(s.PendingServerIP, s.PendingServerLogin, pass)
 	if err != nil {
 		// SSH works but AWG not found — offer installation
-		s.Screen = ScreenInstallConfirm
+		s.setScreen(ScreenInstallConfirm)
 		markup := &tele.ReplyMarkup{}
 		markup.Inline(
 			tele.Row{markup.Data("📦 Установить AWG", btnInstallAWG.Unique)},
@@ -1251,7 +1321,7 @@ func (b *Bot) handleAddServerPass(c tele.Context, s *UserSession, input string) 
 	s.PendingServerDir = det.ConfDir
 	s.PendingServerIface = det.Iface
 	s.PendingServerVer = det.Version
-	s.Screen = ScreenAddServerName
+	s.setScreen(ScreenAddServerName)
 
 	text := fmt.Sprintf("✅ Подключение успешно!\nРежим: %s\nВерсия: %s\nИнтерфейс: %s\nПуть: %s\n\nВведите имя сервера:",
 		modeLabel(det.Mode), versionLabel(det.Version), det.Iface, det.ConfDir)
@@ -1267,29 +1337,33 @@ func (b *Bot) handleAddServerName(c tele.Context, s *UserSession, input string) 
 	}
 
 	uid := c.Sender().ID
-	newSrv := ServerConfig{
-		Name:        name,
-		IP:          s.PendingServerIP,
-		Login:       s.PendingServerLogin,
-		Pass:        s.PendingServerPass,
-		AllowedUIDs: []int64{uid},
-		Mode:        s.PendingServerMode,
-		AWGConfDir:  s.PendingServerDir,
-		Port:        s.PendingInstallPort,
-		NetIface:    s.PendingNetIface,
-		AWGVersion:  int(s.PendingServerVer.Version),
-		AWGToolsVer: s.PendingServerVer.ToolsRaw,
-	}
-	// Дефолтное имя интерфейса в YAML не пишем — его подставит IfaceName().
-	if s.PendingServerIface != defaultIfaceName {
-		newSrv.Iface = s.PendingServerIface
-	}
-	if s.PendingInstallIPv6 && s.PendingIPv6Subnet != "" {
-		newSrv.IPv6Subnet = s.PendingIPv6Subnet
-		if s.PendingIPv6IfaceAddr != "" && s.PendingIPv6IfaceAddr != s.PendingIPv6Subnet {
-			newSrv.IPv6IfaceAddr = s.PendingIPv6IfaceAddr
+	// Читаем результаты детекта/установки согласованно: их пишет горутина установки.
+	var newSrv ServerConfig
+	s.withLock(func() {
+		newSrv = ServerConfig{
+			Name:        name,
+			IP:          s.PendingServerIP,
+			Login:       s.PendingServerLogin,
+			Pass:        s.PendingServerPass,
+			AllowedUIDs: []int64{uid},
+			Mode:        s.PendingServerMode,
+			AWGConfDir:  s.PendingServerDir,
+			Port:        s.PendingInstallPort,
+			NetIface:    s.PendingNetIface,
+			AWGVersion:  int(s.PendingServerVer.Version),
+			AWGToolsVer: s.PendingServerVer.ToolsRaw,
 		}
-	}
+		// Дефолтное имя интерфейса в YAML не пишем — его подставит IfaceName().
+		if s.PendingServerIface != defaultIfaceName {
+			newSrv.Iface = s.PendingServerIface
+		}
+		if s.PendingInstallIPv6 && s.PendingIPv6Subnet != "" {
+			newSrv.IPv6Subnet = s.PendingIPv6Subnet
+			if s.PendingIPv6IfaceAddr != "" && s.PendingIPv6IfaceAddr != s.PendingIPv6Subnet {
+				newSrv.IPv6IfaceAddr = s.PendingIPv6IfaceAddr
+			}
+		}
+	})
 
 	// Don't store mode/dir for docker with default path (keep config clean)
 	if newSrv.Mode == "docker" && newSrv.AWGConfDir == defaultDockerDir {
@@ -1363,7 +1437,7 @@ func (b *Bot) cbAdminSel(c tele.Context) error {
 }
 
 func (b *Bot) showAdminList(s *UserSession, bot *tele.Bot, uid int64) error {
-	s.Screen = ScreenAdminList
+	s.setScreen(ScreenAdminList)
 
 	cfg := b.cfg.Get()
 	idx := s.PendingAdminServerIdx
@@ -1404,7 +1478,7 @@ func (b *Bot) cbAdminAdd(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 
-	s.Screen = ScreenAdminAdd
+	s.setScreen(ScreenAdminAdd)
 
 	text := "Введите Telegram UID нового админа:"
 	markup := &tele.ReplyMarkup{}
@@ -1418,12 +1492,46 @@ func (b *Bot) handleAdminAdd(c tele.Context, s *UserSession, input string) error
 		return b.showError(s, c.Bot(), "❌ Введите корректный числовой UID.")
 	}
 
+	uid := c.Sender().ID
+	if _, err := b.adminTargetServer(uid, s.PendingAdminServerIdx); err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
 	if err := b.cfg.AddAllowedUID(s.PendingAdminServerIdx, newUID); err != nil {
 		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка: %v", err))
 	}
 
-	uid := c.Sender().ID
 	return b.showAdminList(s, c.Bot(), uid)
+}
+
+// adminTargetServer проверяет, что вызывающий действительно имеет доступ к
+// серверу с индексом idx. Индекс лежит в сессии и переживает перезагрузку
+// config.yaml, удаление серверов и смену allowed_uids, а нулевое значение —
+// валидный индекс первого сервера, поэтому право проверяется на каждое действие,
+// а не только в момент выбора сервера в меню.
+func (b *Bot) adminTargetServer(uid int64, idx int) (ServerConfig, error) {
+	cfg := b.cfg.Get()
+	if idx < 0 || idx >= len(cfg.Servers) {
+		return ServerConfig{}, fmt.Errorf("❌ Сервер не найден.")
+	}
+	for _, allowed := range b.cfg.ServersForUser(uid) {
+		if allowed == idx {
+			return cfg.Servers[idx], nil
+		}
+	}
+	return ServerConfig{}, fmt.Errorf("❌ У вас нет доступа к этому серверу.\nВаш UID: %d", uid)
+}
+
+// canManageReports — кто вправе менять report_uids, то есть список суперадминов.
+// Без этой проверки любой обычный админ добавлял бы в отчёты себя и становился
+// суперадмином, отключая модель видимости ключей, которая его же и ограничивает.
+// Если суперадминов ещё нет, право у создателя сервера — первого UID в
+// allowed_uids (его проставляет handleAddServerName).
+func canManageReports(uid int64, srv ServerConfig) bool {
+	if isSuperAdmin(uid, srv) {
+		return true
+	}
+	return len(srv.ReportUIDs) == 0 && len(srv.AllowedUIDs) > 0 && srv.AllowedUIDs[0] == uid
 }
 
 func (b *Bot) cbAdminEdit(c tele.Context) error {
@@ -1439,7 +1547,7 @@ func (b *Bot) cbAdminEdit(c tele.Context) error {
 	}
 
 	s.PendingAdminUID = adminUID
-	s.Screen = ScreenAdminEdit
+	s.setScreen(ScreenAdminEdit)
 
 	return b.showAdminEdit(s, c.Bot(), uid)
 }
@@ -1486,6 +1594,22 @@ func (b *Bot) cbAdminDelete(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 
+	srv, err := b.adminTargetServer(uid, s.PendingAdminServerIdx)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	// Последнего админа удалять нельзя: allowed_uids опустеет, и вернуть доступ
+	// можно будет только правкой config.yaml на сервере вручную.
+	if len(srv.AllowedUIDs) <= 1 {
+		return b.showError(s, c.Bot(), "❌ Нельзя удалить последнего админа сервера.\nСначала добавьте другого.")
+	}
+	// Снять суперадмина вправе только суперадмин — иначе обычный админ удалял бы
+	// того, кто его контролирует.
+	if isSuperAdmin(s.PendingAdminUID, srv) && !isSuperAdmin(uid, srv) {
+		return b.showError(s, c.Bot(), "❌ Удалять суперадмина может только суперадмин.")
+	}
+
 	if err := b.cfg.RemoveAllowedUID(s.PendingAdminServerIdx, s.PendingAdminUID); err != nil {
 		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка: %v", err))
 	}
@@ -1499,15 +1623,18 @@ func (b *Bot) cbAdminToggleReport(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 
-	cfg := b.cfg.Get()
 	idx := s.PendingAdminServerIdx
-	if idx < 0 || idx >= len(cfg.Servers) {
-		return b.showError(s, c.Bot(), "❌ Сервер не найден.")
+	srv, err := b.adminTargetServer(uid, idx)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+	if !canManageReports(uid, srv) {
+		return b.showError(s, c.Bot(), "❌ Управлять списком суперадминов (отчёты) может только суперадмин.")
 	}
 
 	// Check if already in report_uids
 	inReport := false
-	for _, u := range cfg.Servers[idx].ReportUIDs {
+	for _, u := range srv.ReportUIDs {
 		if u == s.PendingAdminUID {
 			inReport = true
 			break
@@ -1701,7 +1828,7 @@ func (b *Bot) cbInstallAWG(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 
-	s.Screen = ScreenInstallPort
+	s.setScreen(ScreenInstallPort)
 	s.PendingInstallPort = 0
 	s.PendingInstallIPv6 = false
 	s.PendingIPv6Subnet = ""
@@ -1767,7 +1894,7 @@ func (b *Bot) afterPortSelected(s *UserSession, bot *tele.Bot, uid int64) error 
 			ifaceAddr, clientSubnet, _ := calculateVPNv6Subnet(ipv6Addr, prefix)
 			s.PendingIPv6IfaceAddr = ifaceAddr
 			s.PendingIPv6Subnet = clientSubnet
-			s.Screen = ScreenInstallIPv6
+			s.setScreen(ScreenInstallIPv6)
 
 			text := fmt.Sprintf("🌐 IPv6 обнаружен: %s/%d\nVPN подсеть: %s\n\nВключить IPv6 для VPN?", ipv6Addr, prefix, clientSubnet)
 			markup := &tele.ReplyMarkup{}
@@ -1815,26 +1942,41 @@ func (b *Bot) cbIPv6No(c tele.Context) error {
 }
 
 func (b *Bot) startInstallation(s *UserSession, bot *tele.Bot, uid int64) {
-	s.Screen = ScreenInstallProgress
+	s.setScreen(ScreenInstallProgress)
 	_ = b.editOrSend(s, bot, "⏳ Установка AWG...\n\nШаг 1/13: Диагностика...", nil)
 
-	go func() {
-		srv := ServerConfig{
+	// Снимаем параметры установки ДО запуска горутины: дальше она уже не должна
+	// читать поля сессии напрямую — их в это же время правят обработчики кнопок.
+	var (
+		srv                                     ServerConfig
+		installPort                             int
+		installIPv6                             bool
+		installIPv6IfaceAddr, installIPv6Subnet string
+	)
+	s.withLock(func() {
+		srv = ServerConfig{
+			Name:  s.PendingServerIP, // иначе SSH-ошибки печатаются с пустым именем
 			IP:    s.PendingServerIP,
 			Login: s.PendingServerLogin,
 			Pass:  s.PendingServerPass,
 		}
+		installPort = s.PendingInstallPort
+		installIPv6 = s.PendingInstallIPv6
+		installIPv6IfaceAddr = s.PendingIPv6IfaceAddr
+		installIPv6Subnet = s.PendingIPv6Subnet
+	})
 
+	go func() {
 		progressFn := func(text string) {
-			if s.Screen != ScreenInstallProgress {
+			if s.screen() != ScreenInstallProgress {
 				return
 			}
 			_ = b.editOrSend(s, bot, "⏳ Установка AWG...\n\n"+text, nil)
 		}
 
-		installLog, diag, err := InstallAWGNative(srv, s.PendingInstallPort, s.PendingInstallIPv6, s.PendingIPv6IfaceAddr, s.PendingIPv6Subnet, progressFn)
+		installLog, diag, err := InstallAWGNative(srv, installPort, installIPv6, installIPv6IfaceAddr, installIPv6Subnet, progressFn)
 		if err != nil {
-			if s.Screen != ScreenInstallProgress {
+			if s.screen() != ScreenInstallProgress {
 				return
 			}
 			progressFn("❌ Ошибка! Откатываю...")
@@ -1849,7 +1991,7 @@ func (b *Bot) startInstallation(s *UserSession, bot *tele.Bot, uid int64) {
 					FileName: "install_log.txt",
 					Caption:  "Лог установки AWG. Перешлите разработчику для диагностики.",
 				}
-				_, _ = bot.Send(&tele.Chat{ID: s.ChatID}, doc)
+				_, _ = bot.Send(&tele.Chat{ID: s.chatID()}, doc)
 			}
 
 			errText := fmt.Sprintf("❌ Установка не удалась. Откат выполнен.\n\nОшибка: %s", installLog.LastError())
@@ -1862,31 +2004,37 @@ func (b *Bot) startInstallation(s *UserSession, bot *tele.Bot, uid int64) {
 			return
 		}
 
-		if s.Screen != ScreenInstallProgress {
+		if s.screen() != ScreenInstallProgress {
 			return
 		}
 
-		// Success
-		s.PendingServerMode = "native"
-		s.PendingServerDir = defaultNativeDir
-		s.PendingServerIface = defaultIfaceName
+		// Версию определяем ДО взятия мьютекса: это SSH-запрос на несколько секунд.
 		nativeSrv := srv
 		nativeSrv.Mode = "native"
-		if info, verErr := detectAWGVersion(nativeSrv); verErr == nil {
-			s.PendingServerVer = info
-		} else {
+		info, verErr := detectAWGVersion(nativeSrv)
+		if verErr != nil {
 			log.Printf("детект версии AWG после установки: %v", verErr)
 		}
-		if diag != nil {
-			s.PendingNetIface = diag.NetIface
-		}
-		s.Screen = ScreenAddServerName
+
+		// Success
+		s.withLock(func() {
+			s.PendingServerMode = "native"
+			s.PendingServerDir = defaultNativeDir
+			s.PendingServerIface = defaultIfaceName
+			if verErr == nil {
+				s.PendingServerVer = info
+			}
+			if diag != nil {
+				s.PendingNetIface = diag.NetIface
+			}
+			s.Screen = ScreenAddServerName
+		})
 
 		ipv6Line := "нет"
-		if s.PendingInstallIPv6 {
-			ipv6Line = s.PendingIPv6Subnet
+		if installIPv6 {
+			ipv6Line = installIPv6Subnet
 		}
-		text := fmt.Sprintf("✅ AWG установлен!\nПорт: %d\nIPv6: %s\n\nВведите имя сервера:", s.PendingInstallPort, ipv6Line)
+		text := fmt.Sprintf("✅ AWG установлен!\nПорт: %d\nIPv6: %s\n\nВведите имя сервера:", installPort, ipv6Line)
 		markup := &tele.ReplyMarkup{}
 		markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
 		_ = b.editOrSend(s, bot, text, markup)

@@ -71,6 +71,47 @@ func TestServerConfigYAMLRoundTrip(t *testing.T) {
 	}
 }
 
+// Get() обязан отдавать независимую копию: вызывающие держат сервер по указателю
+// (resolveServer) и читают его без блокировки, пока мутаторы правят элементы
+// среза на месте.
+func TestGetReturnsIndependentCopy(t *testing.T) {
+	tmp, err := os.CreateTemp("", "config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	tmp.WriteString("bot_token: \"t\"\nservers:\n  - name: \"s1\"\n    ip: \"1.1.1.1\"\n    login: \"r\"\n    pass: \"p\"\n    allowed_uids: [111]\n    report_uids: [111]\n")
+	tmp.Close()
+
+	cm := NewConfigManager(tmp.Name())
+	if err := cm.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	snapshot := cm.Get()
+	if err := cm.RenameServer(0, "renamed"); err != nil {
+		t.Fatalf("RenameServer failed: %v", err)
+	}
+	if err := cm.AddAllowedUID(0, 222); err != nil {
+		t.Fatalf("AddAllowedUID failed: %v", err)
+	}
+
+	if snapshot.Servers[0].Name != "s1" {
+		t.Errorf("ранее полученная копия изменилась: %s", snapshot.Servers[0].Name)
+	}
+	if len(snapshot.Servers[0].AllowedUIDs) != 1 {
+		t.Errorf("срез allowed_uids разделяется с менеджером: %v", snapshot.Servers[0].AllowedUIDs)
+	}
+
+	// Правка копии не должна доезжать до менеджера.
+	snapshot.Servers[0].Name = "hacked"
+	snapshot.Servers[0].ReportUIDs[0] = 999
+	fresh := cm.Get()
+	if fresh.Servers[0].Name != "renamed" || fresh.Servers[0].ReportUIDs[0] != 111 {
+		t.Errorf("правка копии просочилась в конфиг: %+v", fresh.Servers[0])
+	}
+}
+
 // SetAWGInfo пишет версию и интерфейс в config.yaml; дефолтный awg0 не пишется.
 func TestSetAWGInfo(t *testing.T) {
 	tmp, err := os.CreateTemp("", "config-*.yaml")

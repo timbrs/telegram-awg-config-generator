@@ -289,6 +289,15 @@ func buildServerConf(privKey string, port int, netIface string, awgParams map[st
 	return sb.String()
 }
 
+const (
+	// ulaFallbackAddr — ULA-адрес на случай, когда у сервера нет пригодного
+	// глобального префикса. Прежнее значение "fd00:awg::1" было невалидным
+	// IPv6-литералом ('w' и 'g' — не шестнадцатеричные цифры), из-за чего
+	// awg-quick не мог поднять интерфейс, а аллокатор срывался в строковый режим.
+	ulaFallbackAddr = "fd00:a::1"
+	ulaFallbackCIDR = ulaFallbackAddr + "/112"
+)
+
 // calculateVPNv6Subnet computes IPv6 addressing for the AWG VPN.
 // Returns:
 //   - ifaceAddr: address for [Interface] Address line (e.g. "2a01:db8::1/64")
@@ -301,12 +310,12 @@ func buildServerConf(privKey string, port int, netIface string, awgParams map[st
 func calculateVPNv6Subnet(serverIPv6 string, prefixLen int) (ifaceAddr, clientSubnet, serverIP string) {
 	ip := net.ParseIP(serverIPv6)
 	if ip == nil {
-		return "fd00:awg::1/112", "fd00:awg::1/112", "fd00:awg::1"
+		return ulaFallbackCIDR, ulaFallbackCIDR, ulaFallbackAddr
 	}
 
 	ip16 := ip.To16()
 	if ip16 == nil {
-		return "fd00:awg::1/112", "fd00:awg::1/112", "fd00:awg::1"
+		return ulaFallbackCIDR, ulaFallbackCIDR, ulaFallbackAddr
 	}
 
 	switch {
@@ -349,7 +358,7 @@ func calculateVPNv6Subnet(serverIPv6 string, prefixLen int) (ifaceAddr, clientSu
 
 	default:
 		// Prefix longer than /64 — use ULA
-		return "fd00:awg::1/112", "fd00:awg::1/112", "fd00:awg::1"
+		return ulaFallbackCIDR, ulaFallbackCIDR, ulaFallbackAddr
 	}
 }
 
@@ -452,8 +461,11 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 
 	// Step 7: Create config directory
 	progressFn(fmt.Sprintf("Шаг 7/%d: Создание директории конфигов...", totalSteps))
+	// Помечаем в выводе, существовала ли директория ДО нас: откат вправе удалять
+	// её только если создал сам, иначе rm -rf снесёт чужой боевой конфиг.
 	_, err = runInstallStep(log, srv, "Create config directory",
-		fmt.Sprintf("mkdir -p %s", defaultNativeDir), 10*time.Second)
+		fmt.Sprintf("sh -c 'if [ -d %s ]; then echo %s; else mkdir -p %s; fi'",
+			defaultNativeDir, confDirExistedMarker, defaultNativeDir), 10*time.Second)
 	if err != nil {
 		log.FinalStatus = "failed"
 		log.FinishedAt = time.Now()
@@ -494,7 +506,11 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 	// параметры 3.0 бот сам не генерирует (см. CLAUDE.md).
 	confContent := buildServerConf(serverPrivKey, port, diag.NetIface, awgParams, cfgIfaceAddr, cfgClientSubnet, AWGVersion2)
 	confB64 := base64.StdEncoding.EncodeToString([]byte(confContent))
-	confWriteCmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d > %s/%s.conf'", confB64, defaultNativeDir, defaultIfaceName)
+	// umask 077 + chmod 600 — как в writeFileOnServer: под дефолтным umask 022
+	// приватный ключ сервера остался бы world-readable до первой правки конфига
+	// ботом, а `awg-quick strip` ругается на права, отличные от 0600.
+	confPath := fmt.Sprintf("%s/%s.conf", defaultNativeDir, defaultIfaceName)
+	confWriteCmd := fmt.Sprintf("bash -c 'umask 077; printf %%s %s | base64 -d > %s && chmod 600 %s'", confB64, confPath, confPath)
 	_, err = runInstallStep(log, srv, "Write awg0.conf", confWriteCmd, 10*time.Second)
 	if err != nil {
 		log.FinalStatus = "failed"
@@ -505,7 +521,8 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 	// Step 11: Create clientsTable
 	progressFn(fmt.Sprintf("Шаг 11/%d: Создание clientsTable...", totalSteps))
 	tableB64 := base64.StdEncoding.EncodeToString([]byte("[]"))
-	tableCmd := fmt.Sprintf("bash -c 'printf %%s %s | base64 -d > %s/clientsTable'", tableB64, defaultNativeDir)
+	tablePath := defaultNativeDir + "/clientsTable"
+	tableCmd := fmt.Sprintf("bash -c 'umask 077; printf %%s %s | base64 -d > %s && chmod 600 %s'", tableB64, tablePath, tablePath)
 	_, err = runInstallStep(log, srv, "Create clientsTable", tableCmd, 10*time.Second)
 	if err != nil {
 		log.FinalStatus = "failed"
@@ -566,6 +583,21 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 	return log, diag, nil
 }
 
+// confDirExistedMarker печатается шагом создания директории, если она уже была.
+const confDirExistedMarker = "AWG_CONFDIR_EXISTED"
+
+// confDirPreexisted сообщает, существовала ли директория конфигов до установки.
+// Если да — откат не вправе её удалять: там чужой awg0.conf с приватным ключом
+// и clientsTable со всеми клиентами.
+func confDirPreexisted(log *InstallLog) bool {
+	for _, step := range log.Steps {
+		if step.StepName == "Create config directory" && !step.Rollback {
+			return strings.Contains(step.Output, confDirExistedMarker)
+		}
+	}
+	return false
+}
+
 // RollbackAWGInstall attempts to undo a failed installation.
 func RollbackAWGInstall(srv ServerConfig, log *InstallLog) {
 	// Map step names to rollback commands
@@ -588,6 +620,11 @@ func RollbackAWGInstall(srv ServerConfig, log *InstallLog) {
 		if step.Success && !step.Rollback {
 			succeeded[step.StepName] = true
 		}
+	}
+
+	// Директорию конфигов удаляем только если её создал этот запуск установки.
+	if confDirPreexisted(log) {
+		succeeded["Create config directory"] = false
 	}
 
 	for _, action := range actions {
