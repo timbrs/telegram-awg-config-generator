@@ -27,6 +27,17 @@ const (
 	ScreenServerList                 // server selection
 	ScreenServerRenamePrompt         // server rename: pick which server
 	ScreenServerRenamePending        // server rename: waiting for new name
+	ScreenAddServerIP                // waiting for server IP input
+	ScreenAddServerLogin             // waiting for server login input
+	ScreenAddServerPass              // waiting for server password input
+	ScreenAddServerName              // waiting for server name input
+	ScreenAdminList                  // admin list for a server
+	ScreenAdminAdd                   // waiting for new admin UID input
+	ScreenAdminEdit                  // editing a specific admin
+	ScreenInstallConfirm             // "AWG not found. Install?"
+	ScreenInstallPort                // waiting for port input
+	ScreenInstallIPv6                // "Enable IPv6?"
+	ScreenInstallProgress            // installation in progress
 )
 
 // UserSession tracks the current UI state for a user.
@@ -39,6 +50,21 @@ type UserSession struct {
 	PendingServerIdx  int    // server index for server rename
 	PendingUserMsgIDs []int  // user message IDs to delete after rename
 	Page              int    // current page for paginated lists (0-based)
+	// Add-server flow
+	PendingServerIP    string // IP for new server
+	PendingServerLogin string // login for new server
+	PendingServerPass  string // password for new server
+	PendingServerMode  string // detected mode ("docker"/"native")
+	PendingServerDir   string // detected AWG config dir
+	// Admin management
+	PendingAdminServerIdx int   // server index for admin management
+	PendingAdminUID       int64 // UID of selected admin for editing
+	// Install AWG flow
+	PendingInstallPort  int    // AWG listen port
+	PendingInstallIPv6  bool   // enable IPv6 for VPN
+	PendingIPv6Subnet   string // computed VPN IPv6 client subnet CIDR
+	PendingIPv6IfaceAddr string // computed AWG interface IPv6 address
+	PendingNetIface     string // detected network interface
 }
 
 const clientsPerPage = 30
@@ -58,6 +84,21 @@ var (
 	btnPagePrev     = tele.InlineButton{Unique: "ppv"}
 	btnPageNext     = tele.InlineButton{Unique: "pnx"}
 	btnNoop         = tele.InlineButton{Unique: "noop"}
+	// Add-server
+	btnAddServer = tele.InlineButton{Unique: "asv"}
+	// Admin management
+	btnAdminList         = tele.InlineButton{Unique: "adl"}
+	btnAdminSel          = tele.InlineButton{Unique: "ads"}
+	btnAdminAdd          = tele.InlineButton{Unique: "ada"}
+	btnAdminEdit         = tele.InlineButton{Unique: "ade"}
+	btnAdminDelete       = tele.InlineButton{Unique: "add"}
+	btnAdminToggleReport = tele.InlineButton{Unique: "adr"}
+	btnAdminBack         = tele.InlineButton{Unique: "adb"}
+	// Install AWG
+	btnInstallAWG  = tele.InlineButton{Unique: "iaw"}
+	btnPortDefault = tele.InlineButton{Unique: "pd"}
+	btnIPv6Yes     = tele.InlineButton{Unique: "i6y"}
+	btnIPv6No      = tele.InlineButton{Unique: "i6n"}
 )
 
 type Bot struct {
@@ -139,6 +180,21 @@ func (b *Bot) Start() {
 	b.bot.Handle(&btnPagePrev, b.cbPagePrev)
 	b.bot.Handle(&btnPageNext, b.cbPageNext)
 	b.bot.Handle(&btnNoop, func(c tele.Context) error { return c.Respond() })
+	// Add-server
+	b.bot.Handle(&btnAddServer, b.cbAddServer)
+	// Admin management
+	b.bot.Handle(&btnAdminList, b.cbAdminList)
+	b.bot.Handle(&btnAdminSel, b.cbAdminSel)
+	b.bot.Handle(&btnAdminAdd, b.cbAdminAdd)
+	b.bot.Handle(&btnAdminEdit, b.cbAdminEdit)
+	b.bot.Handle(&btnAdminDelete, b.cbAdminDelete)
+	b.bot.Handle(&btnAdminToggleReport, b.cbAdminToggleReport)
+	b.bot.Handle(&btnAdminBack, b.cbAdminBack)
+	// Install AWG
+	b.bot.Handle(&btnInstallAWG, b.cbInstallAWG)
+	b.bot.Handle(&btnPortDefault, b.cbPortDefault)
+	b.bot.Handle(&btnIPv6Yes, b.cbIPv6Yes)
+	b.bot.Handle(&btnIPv6No, b.cbIPv6No)
 
 	_ = b.bot.SetCommands([]tele.Command{
 		{Text: "start", Description: "Главное меню"},
@@ -226,9 +282,7 @@ func (b *Bot) showMainMenuWithHeader(s *UserSession, bot *tele.Bot, uid int64, h
 	rows := []tele.Row{
 		{markup.Data("📋 Статус", btnStatus.Unique), markup.Data("➕ Новый", btnNew.Unique)},
 		{markup.Data("🗑 Удалить", btnDeleteList.Unique), markup.Data("✏️ Rename", btnRenameList.Unique)},
-	}
-	if len(indices) > 1 {
-		rows = append(rows, tele.Row{markup.Data("🖥 Сервер", btnServerList.Unique)})
+		{markup.Data("🖥 Сервер", btnServerList.Unique)},
 	}
 	markup.Inline(rows...)
 
@@ -240,8 +294,6 @@ func (b *Bot) showLoading(s *UserSession, bot *tele.Bot, uid int64, loadingBtn s
 	if s.MessageID == 0 {
 		return
 	}
-
-	indices := b.cfg.ServersForUser(uid)
 
 	type btnDef struct {
 		label  string
@@ -263,9 +315,7 @@ func (b *Bot) showLoading(s *UserSession, bot *tele.Bot, uid int64, loadingBtn s
 	rows := []tele.Row{
 		{markup.Data(buttons[0].label, buttons[0].unique), markup.Data(buttons[1].label, buttons[1].unique)},
 		{markup.Data(buttons[2].label, buttons[2].unique), markup.Data(buttons[3].label, buttons[3].unique)},
-	}
-	if len(indices) > 1 {
-		rows = append(rows, tele.Row{markup.Data("🖥 Сервер", btnServerList.Unique)})
+		{markup.Data("🖥 Сервер", btnServerList.Unique)},
 	}
 	markup.Inline(rows...)
 
@@ -339,13 +389,42 @@ func pageRow(markup *tele.ReplyMarkup, page, totalItems int) *tele.Row {
 	return &row
 }
 
-func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
+// clientByNumberOnPage находит клиента по отображённому номеру (ID) среди клиентов
+// текущей страницы; возвращает nil, если такого номера на странице нет.
+func clientByNumberOnPage(page []ClientEntry, num int) *ClientEntry {
+	for i := range page {
+		if page[i].ID == num {
+			return &page[i]
+		}
+	}
+	return nil
+}
+
+// invalidNumberMsg формирует сообщение об ошибке с диапазоном доступных номеров.
+func invalidNumberMsg(page []ClientEntry, num int) string {
+	if len(page) == 0 {
+		return "❌ Список пуст."
+	}
+	lo, hi := page[0].ID, page[0].ID
+	for _, cl := range page {
+		if cl.ID < lo {
+			lo = cl.ID
+		}
+		if cl.ID > hi {
+			hi = cl.ID
+		}
+	}
+	return fmt.Sprintf("❌ Неверный номер: %d. Доступны от %d до %d.", num, lo, hi)
+}
+
+func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig, uid int64) error {
 	s.Screen = ScreenStatus
 
-	clients, err := ListClients(srv)
+	clients, err := b.listVisibleClients(srv, uid)
 	if err != nil {
 		return b.showError(s, bot, formatError(srv, "", err, ""))
 	}
+	super := isSuperAdmin(uid, srv)
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📋 Сервер: %s (всего: %d)\n\n", srv.Name, len(clients)))
@@ -375,7 +454,16 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig) error 
 				}
 			}
 			icon := statusIcon(handshake)
-			sb.WriteString(fmt.Sprintf("#%d %s  %s%s  ↓%s ↑%s\n", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), rx, tx))
+			line := fmt.Sprintf("#%d %s  %s%s  ↓%s ↑%s", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), rx, tx)
+			// Суперадмину показываем владельца ключа.
+			if super {
+				if cl.UserData.CreatorUID != 0 {
+					line += fmt.Sprintf("  👤%d", cl.UserData.CreatorUID)
+				} else {
+					line += "  👤—"
+				}
+			}
+			sb.WriteString(line + "\n")
 		}
 	}
 
@@ -403,10 +491,10 @@ func (b *Bot) showNewPrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) err
 	return b.editOrSend(s, bot, text, markup)
 }
 
-func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
+func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig, uid int64) error {
 	s.Screen = ScreenDeletePrompt
 
-	clients, err := ListClients(srv)
+	clients, err := b.listVisibleClients(srv, uid)
 	if err != nil {
 		return b.showError(s, bot, formatError(srv, "", err, ""))
 	}
@@ -442,10 +530,10 @@ func (b *Bot) showDeletePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) 
 	return b.editOrSend(s, bot, sb.String(), markup)
 }
 
-func (b *Bot) showRenamePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig) error {
+func (b *Bot) showRenamePrompt(s *UserSession, bot *tele.Bot, srv ServerConfig, uid int64) error {
 	s.Screen = ScreenRenamePrompt
 
-	clients, err := ListClients(srv)
+	clients, err := b.listVisibleClients(srv, uid)
 	if err != nil {
 		return b.showError(s, bot, formatError(srv, "", err, ""))
 	}
@@ -478,24 +566,33 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 	indices := b.cfg.ServersForUser(uid)
 	cfg := b.cfg.Get()
 
-	if len(indices) == 0 {
-		return b.showError(s, bot, fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
-	}
+	activeIdx, hasActive := b.state.GetActiveServer(uid)
 
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
-	for i, idx := range indices {
-		srv := cfg.Servers[idx]
-		text := fmt.Sprintf("%s (%s)", srv.Name, srv.IP)
-		rows = append(rows, tele.Row{markup.Data(text, btnServerSel.Unique, strconv.Itoa(i+1))})
+
+	if len(indices) == 0 {
+		// No servers — show only add button
+	} else {
+		for i, idx := range indices {
+			srv := cfg.Servers[idx]
+			text := fmt.Sprintf("%s (%s)", srv.Name, srv.IP)
+			if hasActive && idx == activeIdx {
+				text += " ✅"
+			}
+			rows = append(rows, tele.Row{markup.Data(text, btnServerSel.Unique, strconv.Itoa(i+1))})
+		}
 	}
+
+	rows = append(rows, tele.Row{markup.Data("➕ Добавить сервер", btnAddServer.Unique)})
 	rows = append(rows, tele.Row{
+		markup.Data("👥 Админы", btnAdminList.Unique),
 		markup.Data("✏️ Переименовать", btnServerRename.Unique),
-		markup.Data("↩ Меню", btnMenu.Unique),
 	})
+	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
 	markup.Inline(rows...)
 
-	return b.editOrSend(s, bot, "🖥 Выберите сервер:", markup)
+	return b.editOrSend(s, bot, "🖥 Управление серверами:", markup)
 }
 
 func (b *Bot) showError(s *UserSession, bot *tele.Bot, text string) error {
@@ -542,7 +639,7 @@ func (b *Bot) cbStatus(c tele.Context) error {
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
 	}
-	return b.showStatus(s, c.Bot(), *srv)
+	return b.showStatus(s, c.Bot(), *srv, uid)
 }
 
 func (b *Bot) cbRefresh(c tele.Context) error {
@@ -557,7 +654,7 @@ func (b *Bot) cbRefresh(c tele.Context) error {
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
 	}
-	return b.showStatus(s, c.Bot(), *srv)
+	return b.showStatus(s, c.Bot(), *srv, uid)
 }
 
 func (b *Bot) cbNew(c tele.Context) error {
@@ -586,7 +683,7 @@ func (b *Bot) cbDeleteList(c tele.Context) error {
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
 	}
-	return b.showDeletePrompt(s, c.Bot(), *srv)
+	return b.showDeletePrompt(s, c.Bot(), *srv, uid)
 }
 
 func (b *Bot) cbRenameList(c tele.Context) error {
@@ -602,7 +699,7 @@ func (b *Bot) cbRenameList(c tele.Context) error {
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
 	}
-	return b.showRenamePrompt(s, c.Bot(), *srv)
+	return b.showRenamePrompt(s, c.Bot(), *srv, uid)
 }
 
 func (b *Bot) cbServerList(c tele.Context) error {
@@ -669,11 +766,11 @@ func (b *Bot) redrawCurrentScreen(s *UserSession, bot *tele.Bot, uid int64) erro
 	}
 	switch s.Screen {
 	case ScreenStatus:
-		return b.showStatus(s, bot, *srv)
+		return b.showStatus(s, bot, *srv, uid)
 	case ScreenDeletePrompt:
-		return b.showDeletePrompt(s, bot, *srv)
+		return b.showDeletePrompt(s, bot, *srv, uid)
 	case ScreenRenamePrompt:
-		return b.showRenamePrompt(s, bot, *srv)
+		return b.showRenamePrompt(s, bot, *srv, uid)
 	default:
 		return b.showMainMenu(s, bot, uid)
 	}
@@ -760,6 +857,18 @@ func (b *Bot) onText(c tele.Context) error {
 		return b.handleRenameExecute(c, s, text)
 	case ScreenServerRenamePending:
 		return b.handleServerRenameExecute(c, s, text)
+	case ScreenAddServerIP:
+		return b.handleAddServerIP(c, s, text)
+	case ScreenAddServerLogin:
+		return b.handleAddServerLogin(c, s, text)
+	case ScreenAddServerPass:
+		return b.handleAddServerPass(c, s, text)
+	case ScreenAddServerName:
+		return b.handleAddServerName(c, s, text)
+	case ScreenAdminAdd:
+		return b.handleAdminAdd(c, s, text)
+	case ScreenInstallPort:
+		return b.handleInstallPort(c, s, text)
 	default:
 		return nil // ignore unrelated text
 	}
@@ -779,7 +888,7 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 
 	_ = b.editOrSend(s, c.Bot(), "⏳ Создаю ключ...", nil)
 
-	clientConf, vpnURI, err := AddPeer(*srv, name)
+	clientConf, vpnURI, err := AddPeer(*srv, name, uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
@@ -851,22 +960,21 @@ func (b *Bot) handleDeleteByNumber(c tele.Context, s *UserSession, input string)
 		return b.showError(s, c.Bot(), err2.Error())
 	}
 
-	_ = b.editOrSend(s, c.Bot(), "⏳ Удаляю...", nil)
-
-	clients, err := ListClients(*srv)
+	clients, err := b.listVisibleClients(*srv, uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
 
-	// Validate number is within currently displayed page
+	// Номер ищем среди ключей, видимых пользователю на текущей странице — так
+	// обычный админ не может удалить чужой ключ, подобрав номер.
 	page := paginateClients(clients, s)
-	pageStart := s.Page*clientsPerPage + 1
-	pageEnd := pageStart + len(page) - 1
-	if num < pageStart || num > pageEnd {
-		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. На текущей странице доступны от %d до %d.", num, pageStart, pageEnd))
+	target := clientByNumberOnPage(page, num)
+	if target == nil {
+		return b.showError(s, c.Bot(), invalidNumberMsg(page, num))
 	}
 
-	target := clients[num-1]
+	_ = b.editOrSend(s, c.Bot(), "⏳ Удаляю...", nil)
+
 	if err := RemovePeer(*srv, target.ClientID); err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
@@ -886,20 +994,18 @@ func (b *Bot) handleRenameSelectNumber(c tele.Context, s *UserSession, input str
 		return b.showError(s, c.Bot(), err2.Error())
 	}
 
-	clients, err := ListClients(*srv)
+	clients, err := b.listVisibleClients(*srv, uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
 
-	// Validate number is within currently displayed page
+	// Номер ищем среди видимых пользователю ключей на текущей странице.
 	page := paginateClients(clients, s)
-	pageStart := s.Page*clientsPerPage + 1
-	pageEnd := pageStart + len(page) - 1
-	if num < pageStart || num > pageEnd {
-		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Неверный номер: %d. На текущей странице доступны от %d до %d.", num, pageStart, pageEnd))
+	target := clientByNumberOnPage(page, num)
+	if target == nil {
+		return b.showError(s, c.Bot(), invalidNumberMsg(page, num))
 	}
 
-	target := clients[num-1]
 	s.Screen = ScreenRenamePending
 	s.PendingClientID = target.ClientID
 	s.PendingClientName = target.UserData.ClientName
@@ -954,6 +1060,375 @@ func (b *Bot) handleServerRenameExecute(c tele.Context, s *UserSession, input st
 	return b.showServerList(s, c.Bot(), uid)
 }
 
+// --- Add server handlers ---
+
+func (b *Bot) cbAddServer(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	s.Screen = ScreenAddServerIP
+	s.PendingServerIP = ""
+	s.PendingServerLogin = ""
+	s.PendingServerPass = ""
+	s.PendingServerMode = ""
+	s.PendingServerDir = ""
+
+	text := "🖥 Новый сервер\nВведите IP-адрес:"
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleAddServerIP(c tele.Context, s *UserSession, input string) error {
+	ip := strings.TrimSpace(input)
+	if ip == "" {
+		return b.showError(s, c.Bot(), "❌ IP-адрес не может быть пустым.")
+	}
+
+	s.PendingServerIP = ip
+	s.Screen = ScreenAddServerLogin
+
+	text := fmt.Sprintf("🖥 Новый сервер: %s\nВведите логин (SSH):", ip)
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleAddServerLogin(c tele.Context, s *UserSession, input string) error {
+	login := strings.TrimSpace(input)
+	if login == "" {
+		return b.showError(s, c.Bot(), "❌ Логин не может быть пустым.")
+	}
+
+	s.PendingServerLogin = login
+	s.Screen = ScreenAddServerPass
+
+	text := fmt.Sprintf("🖥 Новый сервер: %s@%s\nВведите пароль (SSH):", login, s.PendingServerIP)
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleAddServerPass(c tele.Context, s *UserSession, input string) error {
+	pass := strings.TrimSpace(input)
+	if pass == "" {
+		return b.showError(s, c.Bot(), "❌ Пароль не может быть пустым.")
+	}
+
+	s.PendingServerPass = pass
+
+	// Delete the password message for security
+	_ = c.Bot().Delete(c.Message())
+
+	_ = b.editOrSend(s, c.Bot(), "⏳ Проверяю подключение...", nil)
+
+	// First check SSH connectivity
+	tmpSrv := ServerConfig{IP: s.PendingServerIP, Login: s.PendingServerLogin, Pass: pass}
+	if _, sshErr := SSHRun(tmpSrv, "echo ok"); sshErr != nil {
+		markup := &tele.ReplyMarkup{}
+		markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+		return b.editOrSend(s, c.Bot(), fmt.Sprintf("❌ SSH подключение не удалось: %v", sshErr), markup)
+	}
+
+	mode, dir, err := detectAWGMode(s.PendingServerIP, s.PendingServerLogin, pass)
+	if err != nil {
+		// SSH works but AWG not found — offer installation
+		s.Screen = ScreenInstallConfirm
+		markup := &tele.ReplyMarkup{}
+		markup.Inline(
+			tele.Row{markup.Data("📦 Установить AWG", btnInstallAWG.Unique)},
+			tele.Row{markup.Data("↩ Назад", btnServerList.Unique)},
+		)
+		text := fmt.Sprintf("⚠️ AWG не обнаружен на сервере %s\nХотите установить AmneziaWG?", s.PendingServerIP)
+		return b.editOrSend(s, c.Bot(), text, markup)
+	}
+
+	s.PendingServerMode = mode
+	s.PendingServerDir = dir
+	s.Screen = ScreenAddServerName
+
+	modeLabel := "Docker"
+	if mode == "native" {
+		modeLabel = "Native"
+	}
+	text := fmt.Sprintf("✅ Подключение успешно!\nРежим: %s\nПуть: %s\n\nВведите имя сервера:", modeLabel, dir)
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleAddServerName(c tele.Context, s *UserSession, input string) error {
+	name := sanitizeName(input)
+	if name == "" {
+		return b.showError(s, c.Bot(), "❌ Имя сервера не может быть пустым.")
+	}
+
+	uid := c.Sender().ID
+	newSrv := ServerConfig{
+		Name:        name,
+		IP:          s.PendingServerIP,
+		Login:       s.PendingServerLogin,
+		Pass:        s.PendingServerPass,
+		AllowedUIDs: []int64{uid},
+		Mode:        s.PendingServerMode,
+		AWGConfDir:  s.PendingServerDir,
+		Port:        s.PendingInstallPort,
+		NetIface:    s.PendingNetIface,
+	}
+	if s.PendingInstallIPv6 && s.PendingIPv6Subnet != "" {
+		newSrv.IPv6Subnet = s.PendingIPv6Subnet
+		if s.PendingIPv6IfaceAddr != "" && s.PendingIPv6IfaceAddr != s.PendingIPv6Subnet {
+			newSrv.IPv6IfaceAddr = s.PendingIPv6IfaceAddr
+		}
+	}
+
+	// Don't store mode/dir for docker with default path (keep config clean)
+	if newSrv.Mode == "docker" && newSrv.AWGConfDir == defaultDockerDir {
+		newSrv.Mode = ""
+		newSrv.AWGConfDir = ""
+	}
+	// Don't store default port
+	if newSrv.Port == 51820 {
+		newSrv.Port = 0
+	}
+
+	if err := b.cfg.AddServer(newSrv); err != nil {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка добавления: %v", err))
+	}
+
+	return b.showMainMenuWithHeader(s, c.Bot(), uid, fmt.Sprintf("✅ Сервер \"%s\" добавлен", name))
+}
+
+// --- Admin management handlers ---
+
+func (b *Bot) cbAdminList(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	indices := b.cfg.ServersForUser(uid)
+	if len(indices) == 0 {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
+	}
+
+	if len(indices) == 1 {
+		s.PendingAdminServerIdx = indices[0]
+		return b.showAdminList(s, c.Bot(), uid)
+	}
+
+	// Multiple servers — show selection
+	cfg := b.cfg.Get()
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for i, idx := range indices {
+		srv := cfg.Servers[idx]
+		text := fmt.Sprintf("%s (%s)", srv.Name, srv.IP)
+		rows = append(rows, tele.Row{markup.Data(text, btnAdminSel.Unique, strconv.Itoa(i+1))})
+	}
+	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	markup.Inline(rows...)
+
+	return b.editOrSend(s, c.Bot(), "👥 Выберите сервер для управления админами:", markup)
+}
+
+func (b *Bot) cbAdminSel(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	data := strings.TrimSpace(c.Callback().Data)
+	num, err := strconv.Atoi(data)
+	if err != nil {
+		return b.showError(s, c.Bot(), "❌ Ошибка выбора сервера.")
+	}
+
+	indices := b.cfg.ServersForUser(uid)
+	if num < 1 || num > len(indices) {
+		return b.showError(s, c.Bot(), "❌ Неверный номер сервера.")
+	}
+
+	s.PendingAdminServerIdx = indices[num-1]
+	return b.showAdminList(s, c.Bot(), uid)
+}
+
+func (b *Bot) showAdminList(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.Screen = ScreenAdminList
+
+	cfg := b.cfg.Get()
+	idx := s.PendingAdminServerIdx
+	if idx < 0 || idx >= len(cfg.Servers) {
+		return b.showError(s, bot, "❌ Сервер не найден.")
+	}
+	srv := cfg.Servers[idx]
+
+	// Build report UID set for quick lookup
+	reportSet := make(map[int64]bool)
+	for _, u := range srv.ReportUIDs {
+		reportSet[u] = true
+	}
+
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, adminUID := range srv.AllowedUIDs {
+		label := fmt.Sprintf("%d", adminUID)
+		if adminUID == uid {
+			label += " (вы)"
+		}
+		if reportSet[adminUID] {
+			label += " 📊"
+		}
+		rows = append(rows, tele.Row{markup.Data(label, btnAdminEdit.Unique, fmt.Sprintf("%d", adminUID))})
+	}
+	rows = append(rows, tele.Row{markup.Data("➕ Добавить", btnAdminAdd.Unique)})
+	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	markup.Inline(rows...)
+
+	text := fmt.Sprintf("👥 Админы сервера: %s\n📊 = получает отчёты", srv.Name)
+	return b.editOrSend(s, bot, text, markup)
+}
+
+func (b *Bot) cbAdminAdd(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	s.Screen = ScreenAdminAdd
+
+	text := "Введите Telegram UID нового админа:"
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnAdminBack.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleAdminAdd(c tele.Context, s *UserSession, input string) error {
+	newUID, err := strconv.ParseInt(strings.TrimSpace(input), 10, 64)
+	if err != nil || newUID <= 0 {
+		return b.showError(s, c.Bot(), "❌ Введите корректный числовой UID.")
+	}
+
+	if err := b.cfg.AddAllowedUID(s.PendingAdminServerIdx, newUID); err != nil {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка: %v", err))
+	}
+
+	uid := c.Sender().ID
+	return b.showAdminList(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbAdminEdit(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	data := strings.TrimSpace(c.Callback().Data)
+	adminUID, err := strconv.ParseInt(data, 10, 64)
+	if err != nil {
+		return b.showError(s, c.Bot(), "❌ Ошибка.")
+	}
+
+	s.PendingAdminUID = adminUID
+	s.Screen = ScreenAdminEdit
+
+	return b.showAdminEdit(s, c.Bot(), uid)
+}
+
+func (b *Bot) showAdminEdit(s *UserSession, bot *tele.Bot, uid int64) error {
+	cfg := b.cfg.Get()
+	idx := s.PendingAdminServerIdx
+	if idx < 0 || idx >= len(cfg.Servers) {
+		return b.showError(s, bot, "❌ Сервер не найден.")
+	}
+	srv := cfg.Servers[idx]
+
+	// Check if admin is in report_uids
+	inReport := false
+	for _, u := range srv.ReportUIDs {
+		if u == s.PendingAdminUID {
+			inReport = true
+			break
+		}
+	}
+
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+
+	rows = append(rows, tele.Row{markup.Data("🗑 Удалить админа", btnAdminDelete.Unique)})
+	if inReport {
+		rows = append(rows, tele.Row{markup.Data("📊 Убрать из отчётов", btnAdminToggleReport.Unique)})
+	} else {
+		rows = append(rows, tele.Row{markup.Data("📊 Добавить в отчёты", btnAdminToggleReport.Unique)})
+	}
+	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnAdminBack.Unique)})
+	markup.Inline(rows...)
+
+	text := fmt.Sprintf("👤 Админ: %d\nСервер: %s", s.PendingAdminUID, srv.Name)
+	if s.PendingAdminUID == uid {
+		text += "\n(это вы)"
+	}
+	return b.editOrSend(s, bot, text, markup)
+}
+
+func (b *Bot) cbAdminDelete(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	if err := b.cfg.RemoveAllowedUID(s.PendingAdminServerIdx, s.PendingAdminUID); err != nil {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка: %v", err))
+	}
+
+	return b.showAdminList(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbAdminToggleReport(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	cfg := b.cfg.Get()
+	idx := s.PendingAdminServerIdx
+	if idx < 0 || idx >= len(cfg.Servers) {
+		return b.showError(s, c.Bot(), "❌ Сервер не найден.")
+	}
+
+	// Check if already in report_uids
+	inReport := false
+	for _, u := range cfg.Servers[idx].ReportUIDs {
+		if u == s.PendingAdminUID {
+			inReport = true
+			break
+		}
+	}
+
+	if inReport {
+		if err := b.cfg.RemoveReportUID(idx, s.PendingAdminUID); err != nil {
+			return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка: %v", err))
+		}
+	} else {
+		if err := b.cfg.AddReportUID(idx, s.PendingAdminUID); err != nil {
+			return b.showError(s, c.Bot(), fmt.Sprintf("❌ Ошибка: %v", err))
+		}
+	}
+
+	return b.showAdminList(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbAdminBack(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	return b.showAdminList(s, c.Bot(), uid)
+}
+
 // sanitizeFileName creates a safe .conf filename for AmneziaWG.
 // WireGuard tunnel names allow only [a-zA-Z0-9_=+.-] and max 15 chars.
 // Format: awg<cleaned_name>.conf
@@ -971,6 +1446,44 @@ func sanitizeFileName(name string) string {
 }
 
 // --- Shared logic ---
+
+// isSuperAdmin сообщает, является ли пользователь суперадмином сервера.
+// Суперадмин — это получатель отчётов (report_uids); он видит все ключи.
+func isSuperAdmin(uid int64, srv ServerConfig) bool {
+	for _, u := range srv.ReportUIDs {
+		if u == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// listVisibleClients возвращает ключи, видимые админу uid, с последовательной
+// перенумерацией (ID = 1..N по порядку создания). Суперадмин видит все ключи;
+// обычный админ — только созданные им и «ничьи» (CreatorUID == 0: старые ключи
+// или созданные через приложение Amnezia). Перенумерация скрывает реальное
+// количество ключей на сервере от обычного админа.
+func (b *Bot) listVisibleClients(srv ServerConfig, uid int64) ([]ClientEntry, error) {
+	all, err := ListClients(srv)
+	if err != nil {
+		return nil, err
+	}
+	return filterVisibleClients(all, uid, isSuperAdmin(uid, srv)), nil
+}
+
+// filterVisibleClients оставляет видимые админу ключи и перенумеровывает их 1..N.
+func filterVisibleClients(all []ClientEntry, uid int64, super bool) []ClientEntry {
+	var vis []ClientEntry
+	for _, c := range all {
+		if super || c.UserData.CreatorUID == 0 || c.UserData.CreatorUID == uid {
+			vis = append(vis, c)
+		}
+	}
+	for i := range vis {
+		vis[i].ID = i + 1
+	}
+	return vis
+}
 
 func (b *Bot) resolveServer(uid int64) (*ServerConfig, error) {
 	indices := b.cfg.ServersForUser(uid)
@@ -1062,6 +1575,198 @@ func formatHandshake(hs string) string {
 		return fmt.Sprintf("%dd %02d:%02d:%02d ago", days, hours, mins, secs)
 	}
 	return fmt.Sprintf("%02d:%02d:%02d ago", hours, mins, secs)
+}
+
+// --- Install AWG handlers ---
+
+func (b *Bot) cbInstallAWG(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	s.Screen = ScreenInstallPort
+	s.PendingInstallPort = 0
+	s.PendingInstallIPv6 = false
+	s.PendingIPv6Subnet = ""
+	s.PendingIPv6IfaceAddr = ""
+	s.PendingNetIface = ""
+
+	text := "📦 Установка AmneziaWG\n\nВведите порт AWG (или нажмите кнопку):"
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(
+		tele.Row{markup.Data("51820 (по умолчанию)", btnPortDefault.Unique)},
+		tele.Row{markup.Data("↩ Назад", btnServerList.Unique)},
+	)
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) cbPortDefault(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	s.PendingInstallPort = 51820
+	return b.afterPortSelected(s, c.Bot(), uid)
+}
+
+func (b *Bot) handleInstallPort(c tele.Context, s *UserSession, input string) error {
+	port, err := strconv.Atoi(strings.TrimSpace(input))
+	if err != nil || port < 1 || port > 65535 {
+		return b.showError(s, c.Bot(), "❌ Введите корректный порт (1-65535).")
+	}
+	s.PendingInstallPort = port
+	uid := c.Sender().ID
+	return b.afterPortSelected(s, c.Bot(), uid)
+}
+
+func (b *Bot) afterPortSelected(s *UserSession, bot *tele.Bot, uid int64) error {
+	// Check IPv6 on server
+	_ = b.editOrSend(s, bot, "⏳ Проверяю IPv6 на сервере...", nil)
+
+	tmpSrv := ServerConfig{IP: s.PendingServerIP, Login: s.PendingServerLogin, Pass: s.PendingServerPass}
+	out, err := SSHRun(tmpSrv, "ip -6 addr show scope global")
+
+	if err == nil && strings.Contains(out, "inet6") {
+		// Parse IPv6 info for display
+		ipv6Addr := ""
+		prefix := 0
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "inet6 ") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					addrCIDR := parts[1]
+					if idx := strings.Index(addrCIDR, "/"); idx != -1 {
+						ipv6Addr = addrCIDR[:idx]
+						fmt.Sscanf(addrCIDR[idx+1:], "%d", &prefix)
+					}
+					break
+				}
+			}
+		}
+
+		if ipv6Addr != "" {
+			ifaceAddr, clientSubnet, _ := calculateVPNv6Subnet(ipv6Addr, prefix)
+			s.PendingIPv6IfaceAddr = ifaceAddr
+			s.PendingIPv6Subnet = clientSubnet
+			s.Screen = ScreenInstallIPv6
+
+			text := fmt.Sprintf("🌐 IPv6 обнаружен: %s/%d\nVPN подсеть: %s\n\nВключить IPv6 для VPN?", ipv6Addr, prefix, clientSubnet)
+			markup := &tele.ReplyMarkup{}
+			markup.Inline(
+				tele.Row{
+					markup.Data("✅ Да", btnIPv6Yes.Unique),
+					markup.Data("❌ Нет", btnIPv6No.Unique),
+				},
+				tele.Row{markup.Data("↩ Назад", btnServerList.Unique)},
+			)
+			return b.editOrSend(s, bot, text, markup)
+		}
+	}
+
+	// No IPv6 — start installation directly
+	s.PendingInstallIPv6 = false
+	s.PendingIPv6Subnet = ""
+	s.PendingIPv6IfaceAddr = ""
+	b.startInstallation(s, bot, uid)
+	return nil
+}
+
+func (b *Bot) cbIPv6Yes(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	s.PendingInstallIPv6 = true
+	b.startInstallation(s, c.Bot(), uid)
+	return nil
+}
+
+func (b *Bot) cbIPv6No(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	s.PendingInstallIPv6 = false
+	s.PendingIPv6Subnet = ""
+	s.PendingIPv6IfaceAddr = ""
+	b.startInstallation(s, c.Bot(), uid)
+	return nil
+}
+
+func (b *Bot) startInstallation(s *UserSession, bot *tele.Bot, uid int64) {
+	s.Screen = ScreenInstallProgress
+	_ = b.editOrSend(s, bot, "⏳ Установка AWG...\n\nШаг 1/13: Диагностика...", nil)
+
+	go func() {
+		srv := ServerConfig{
+			IP:    s.PendingServerIP,
+			Login: s.PendingServerLogin,
+			Pass:  s.PendingServerPass,
+		}
+
+		progressFn := func(text string) {
+			if s.Screen != ScreenInstallProgress {
+				return
+			}
+			_ = b.editOrSend(s, bot, "⏳ Установка AWG...\n\n"+text, nil)
+		}
+
+		installLog, diag, err := InstallAWGNative(srv, s.PendingInstallPort, s.PendingInstallIPv6, s.PendingIPv6IfaceAddr, s.PendingIPv6Subnet, progressFn)
+		if err != nil {
+			if s.Screen != ScreenInstallProgress {
+				return
+			}
+			progressFn("❌ Ошибка! Откатываю...")
+			RollbackAWGInstall(srv, installLog)
+
+			logText := installLog.String()
+
+			// Send log as file if too long
+			if len(logText) > 3500 {
+				doc := &tele.Document{
+					File:     tele.FromReader(strings.NewReader(logText)),
+					FileName: "install_log.txt",
+					Caption:  "Лог установки AWG. Перешлите разработчику для диагностики.",
+				}
+				_, _ = bot.Send(&tele.Chat{ID: s.ChatID}, doc)
+			}
+
+			errText := fmt.Sprintf("❌ Установка не удалась. Откат выполнен.\n\nОшибка: %s", installLog.LastError())
+			if len(logText) <= 3500 {
+				errText += "\n\n" + logText
+			}
+			markup := &tele.ReplyMarkup{}
+			markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+			_ = b.editOrSend(s, bot, errText, markup)
+			return
+		}
+
+		if s.Screen != ScreenInstallProgress {
+			return
+		}
+
+		// Success
+		s.PendingServerMode = "native"
+		s.PendingServerDir = defaultNativeDir
+		if diag != nil {
+			s.PendingNetIface = diag.NetIface
+		}
+		s.Screen = ScreenAddServerName
+
+		ipv6Line := "нет"
+		if s.PendingInstallIPv6 {
+			ipv6Line = s.PendingIPv6Subnet
+		}
+		text := fmt.Sprintf("✅ AWG установлен!\nПорт: %d\nIPv6: %s\n\nВведите имя сервера:", s.PendingInstallPort, ipv6Line)
+		markup := &tele.ReplyMarkup{}
+		markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+		_ = b.editOrSend(s, bot, text, markup)
+	}()
 }
 
 func formatError(srv ServerConfig, cmd string, err error, output string) string {
