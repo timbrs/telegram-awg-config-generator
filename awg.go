@@ -1125,6 +1125,18 @@ type amneziaAWGData struct {
 	Params          map[string]string
 }
 
+// protocol_version в конфиге AmneziaVPN. Значения — не номер версии протокола
+// AWG, а строки, которыми оперирует само приложение (protocolConstants.h:
+// awgV1_5 = "1.5", awgV2 = "2", awgV3 = "3.1"). Для всей ветки 3.x приложение
+// знает единственное значение — "3.1"; если отдать "2", AmneziaVPN 5.x пометит
+// контейнер как устаревший (serverHasOutdatedAwgContainer) и покажет
+// «(version 2)», хотя сервер работает на 3.x.
+const (
+	amneziaProtoV1 = "1"
+	amneziaProtoV2 = "2"
+	amneziaProtoV3 = "3.1"
+)
+
 // amneziaAWGFixedKeys — не-параметрические ключи секции "awg".
 var amneziaAWGFixedKeys = map[string]bool{
 	"last_config": true, "port": true, "protocol_version": true,
@@ -1196,12 +1208,13 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 
 	// Тип контейнера — это версия контейнера Amnezia, а не протокола AWG:
 	// отдельного amnezia-awg3 в приложении AmneziaVPN нет, поэтому все версии
-	// протокола ≥ 2.0 отдаются как amnezia-awg2 / protocol_version = 2.
+	// протокола ≥ 2.0 отдаются как amnezia-awg2.
+	confVersion := deriveConfigVersion(params)
 	containerType := "amnezia-awg"
-	protoVersion := "1"
-	if versionRank(deriveConfigVersion(params)) >= versionRank(AWGVersion2) {
+	protoVersion := amneziaProtoV1
+	if versionRank(confVersion) >= versionRank(AWGVersion2) {
 		containerType = "amnezia-awg2"
-		protoVersion = "2"
+		protoVersion = amneziaProtoV2
 		// Приложение AmneziaVPN ожидает ключи I1-I5 в контейнере awg2;
 		// если сервер их не задаёт — отдаём пустыми.
 		for _, k := range []string{"I1", "I2", "I3", "I4", "I5"} {
@@ -1209,6 +1222,9 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 				local.AWGParams[k] = ""
 			}
 		}
+	}
+	if versionRank(confVersion) >= versionRank(AWGVersion3) {
+		protoVersion = amneziaProtoV3
 	}
 
 	// Build the full WG+AWG config text

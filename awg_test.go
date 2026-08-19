@@ -962,6 +962,7 @@ func TestParseToolsVersion(t *testing.T) {
 		want    AWGVersion
 		wantRaw string
 	}{
+		{"amneziawg-tools v3.1.20260812\n", AWGVersion31, "3.1.20260812"},
 		{"amneziawg-tools v3.0.20260730\n", AWGVersion3, "3.0.20260730"},
 		{"amneziawg-tools v2.0.20250705\n", AWGVersion2, "2.0.20250705"},
 		{"amneziawg-tools v1.5.20250704\n", AWGVersion15, "1.5.20250704"},
@@ -983,6 +984,7 @@ func TestParseKmodVersion(t *testing.T) {
 		want    AWGVersion
 		wantRaw string
 	}{
+		{"version:        3.1.20260812-01\n", AWGVersion31, "3.1.20260812-01"},
 		{"version:        3.0.20260731-04\n", AWGVersion3, "3.0.20260731-04"},
 		{"version: 2.0.20250705\n", AWGVersion2, "2.0.20250705"},
 		{"", AWGVersionUnknown, ""},
@@ -1014,6 +1016,65 @@ func TestParseAWGVersionOutputTakesMin(t *testing.T) {
 	if docker.KmodRaw != "" {
 		t.Errorf("KmodRaw должен быть пуст, получено %q", docker.KmodRaw)
 	}
+
+	// Минорная версия участвует в сравнении так же, как мажорная: tools 3.1
+	// отправят RandomTrailers, а модуль 3.0 отвергнет неизвестный атрибут.
+	mixed := parseAWGVersionOutput("amneziawg-tools v3.1.20260812\nversion:        3.0.20260731-04\n")
+	if mixed.Version != AWGVersion3 {
+		t.Errorf("ожидалась AWG 3.0 (минимум из tools 3.1 и kmod 3.0), получено %v", mixed.Version)
+	}
+
+	full31 := parseAWGVersionOutput("amneziawg-tools v3.1.20260812\nversion:        3.1.20260812-01\n")
+	if full31.Version != AWGVersion31 {
+		t.Errorf("ожидалась AWG 3.1, получено %v", full31.Version)
+	}
+}
+
+// Хронология версий: 1.0 → 1.5 → 2.0 → 3.0 → 3.1. Значение AWGVersion15 и
+// AWGVersion31 выбиваются из неё числом, поэтому порядок даёт только versionRank.
+func TestVersionRankAndString(t *testing.T) {
+	order := []AWGVersion{AWGVersionUnknown, AWGVersion1, AWGVersion15, AWGVersion2, AWGVersion3, AWGVersion31}
+	for i := 1; i < len(order); i++ {
+		if versionRank(order[i-1]) >= versionRank(order[i]) {
+			t.Errorf("%v должна идти раньше %v (ранги %d и %d)",
+				order[i-1], order[i], versionRank(order[i-1]), versionRank(order[i]))
+		}
+	}
+
+	names := map[AWGVersion]string{
+		AWGVersionUnknown: "AWG ?",
+		AWGVersion1:       "AWG 1.0",
+		AWGVersion15:      "AWG 1.5",
+		AWGVersion2:       "AWG 2.0",
+		AWGVersion3:       "AWG 3.0",
+		AWGVersion31:      "AWG 3.1",
+	}
+	for v, want := range names {
+		if got := v.String(); got != want {
+			t.Errorf("String(%d) = %q, ожидалось %q", int(v), got, want)
+		}
+	}
+
+	if minAWGVersion(AWGVersion31, AWGVersion3) != AWGVersion3 {
+		t.Error("более ранняя из 3.1 и 3.0 — это 3.0")
+	}
+}
+
+// Параметры 3.1 должны быть видны версии 3.1 и не видны 3.0, а параметры 3.0 —
+// обеим.
+func TestVersionHasParam31(t *testing.T) {
+	if versionHasParam(AWGVersion3, AWGVersion31) {
+		t.Error("RandomTrailers (3.1) не должен считаться доступным в 3.0")
+	}
+	if !versionHasParam(AWGVersion31, AWGVersion31) {
+		t.Error("параметры 3.1 должны быть доступны в 3.1")
+	}
+	if !versionHasParam(AWGVersion31, AWGVersion3) {
+		t.Error("параметры 3.0 должны быть доступны в 3.1")
+	}
+	if versionHasParam(AWGVersion15, AWGVersion31) {
+		t.Error("в тупиковой ветке 1.5 параметров 3.1 нет")
+	}
 }
 
 func TestDeriveConfigVersion(t *testing.T) {
@@ -1024,6 +1085,12 @@ func TestDeriveConfigVersion(t *testing.T) {
 	}{
 		{"HeaderProtectionKey → 3.0", map[string]string{"S1": "52", "S3": "45", "HeaderProtectionKey": "aaa="}, AWGVersion3},
 		{"ContentPaddingAddition → 3.0", map[string]string{"S1": "52", "ContentPaddingAddition": "64"}, AWGVersion3},
+		{"RandomTrailers → 3.1", map[string]string{"S1": "52", "S3": "45", "RandomTrailers": "on"}, AWGVersion31},
+		{"DisableCookies → 3.1", map[string]string{"S1": "52", "DisableCookies": "1"}, AWGVersion31},
+		{"3.0 + 3.1 → 3.1", map[string]string{"S1": "52", "HeaderProtectionKey": "aaa=", "RandomTrailers": "on"}, AWGVersion31},
+		// Выключенный тумблер равнозначен отсутствующему — так же считает и приложение.
+		{"RandomTrailers = off → не 3.1", map[string]string{"S1": "52", "S3": "45", "RandomTrailers": "off"}, AWGVersion2},
+		{"off + HeaderProtectionKey → 3.0", map[string]string{"S1": "52", "HeaderProtectionKey": "aaa=", "DisableCookies": "off"}, AWGVersion3},
 		{"S3 → 2.0", map[string]string{"S1": "52", "S2": "27", "S3": "45"}, AWGVersion2},
 		{"S4 → 2.0", map[string]string{"S1": "52", "S4": "8"}, AWGVersion2},
 		{"диапазон H1 → 2.0", map[string]string{"S1": "52", "S2": "27", "H1": "100-200"}, AWGVersion2},
@@ -1163,6 +1230,16 @@ func TestServerParamOrder(t *testing.T) {
 	if has(v3, "J1") || has(v3, "Itime") {
 		t.Error("параметров ветки 1.5 в 3.0 быть не должно")
 	}
+	if has(v3, "RandomTrailers") || has(v3, "DisableCookies") {
+		t.Error("тумблеры 3.1 не должны попадать в конфиг 3.0")
+	}
+
+	v31 := serverParamOrder(AWGVersion31)
+	for _, k := range []string{"HeaderProtectionKey", "RandomTrailers", "DisableCookies"} {
+		if !has(v31, k) {
+			t.Errorf("в 3.1 должен быть %s", k)
+		}
+	}
 
 	v1 := serverParamOrder(AWGVersion1)
 	if has(v1, "S3") {
@@ -1193,6 +1270,99 @@ func TestBuildClientConfigV3(t *testing.T) {
 	}
 }
 
+// Серверный awg0.conf в том виде, в каком его пишет AmneziaVPN 5.x с AWG 3.1
+// (client/server_scripts/awg/configure_container.sh): I1-I5 там закомментированы,
+// а тумблеры идут последними. Бот должен опознать 3.1 и донести весь набор до
+// клиента — иначе рукопожатия не будет.
+func TestParseServerConfigAmneziaV31(t *testing.T) {
+	serverConf := `[Interface]
+PrivateKey = ` + testPrivKey + `
+Address = 10.8.1.1/24
+ListenPort = 51820
+Jc = 5
+Jmin = 10
+Jmax = 50
+S1 = 87
+S2 = 41
+S3 = 33
+S4 = 12
+H1 = 1204935283-1204935283
+H2 = 1685061666-1685061666
+H3 = 1301090747-1301090747
+H4 = 1978550559-1978550559
+HeaderProtectionKey = aGVhZGVyS2V5MTIzNDU2Nzg5MA==
+ContentPaddingAddition = 10-100
+RekeyAfterTime = 100-120
+RekeyTimeout = 3-7
+RejectAfterTime = 150-180
+KeepaliveTimeout = 5-15
+MaxHandshakeAttempts = 15-20
+RandomTrailers = on
+DisableCookies = on
+# I1 = <r 2>
+# I2 =
+`
+	params, err := parseServerConfig(serverConf)
+	if err != nil {
+		t.Fatalf("parseServerConfig: %v", err)
+	}
+
+	if params.Version != AWGVersion31 {
+		t.Errorf("версия конфига = %v, ожидалась AWG 3.1", params.Version)
+	}
+	if _, ok := params.AWGParams["I1"]; ok {
+		t.Error("закомментированный I1 не должен попадать в параметры")
+	}
+	if len(params.ExtraParamOrder) != 0 {
+		t.Errorf("все параметры 3.1 должны быть известны боту, в extra попали: %v", params.ExtraParamOrder)
+	}
+
+	// Порядок в клиентском конфиге — как в шаблоне Amnezia: сначала Jc/S/H,
+	// затем параметры 3.0, тумблеры 3.1 последними.
+	order := clientParamOrder(params)
+	want := []string{
+		"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
+		"HeaderProtectionKey", "ContentPaddingAddition",
+		"RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
+		"MaxHandshakeAttempts", "RandomTrailers", "DisableCookies",
+	}
+	if len(order) != len(want) {
+		t.Fatalf("clientParamOrder = %v, ожидалось %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("clientParamOrder = %v, ожидалось %v", order, want)
+		}
+	}
+}
+
+// Тумблеры 3.1 — must-match (RandomTrailers удлиняет handshake-пакеты, приёмник
+// без него их не узнаёт), поэтому они обязаны доезжать до клиента как есть.
+func TestBuildClientConfigV31(t *testing.T) {
+	params := v3Params()
+	params.AWGParams["RandomTrailers"] = "on"
+	params.AWGParams["DisableCookies"] = "on"
+
+	conf := BuildClientConfig("clientPrivKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", "8.8.8.8", "8.8.4.4", params)
+	for _, s := range []string{"RandomTrailers = on", "DisableCookies = on", "HeaderProtectionKey = "} {
+		if !strings.Contains(conf, s) {
+			t.Errorf("config missing: %s\n\nFull config:\n%s", s, conf)
+		}
+	}
+
+	uri, _, err := BuildAmneziaVPNURI("clientPrivKey=", "clientPubKey=", "pskKey=", "10.8.1.5", "1.2.3.4", "51820", "V31Server", "8.8.8.8", "8.8.4.4", params)
+	if err != nil {
+		t.Fatalf("BuildAmneziaVPNURI failed: %v", err)
+	}
+	awg := decodeVPNURI(t, uri).Containers[0].AWG
+	if awg.ProtocolVersion != "3.1" {
+		t.Errorf("expected protocol_version=3.1, got %s", awg.ProtocolVersion)
+	}
+	if awg.Params["RandomTrailers"] != "on" || awg.Params["DisableCookies"] != "on" {
+		t.Errorf("тумблеры 3.1 не доехали до контейнера: %#v", awg.Params)
+	}
+}
+
 func TestBuildAmneziaVPNURIv3(t *testing.T) {
 	params := v3Params()
 
@@ -1211,8 +1381,10 @@ func TestBuildAmneziaVPNURIv3(t *testing.T) {
 		t.Fatalf("expected 1 container, got %d", len(cfg.Containers))
 	}
 	awg := cfg.Containers[0].AWG
-	if awg.ProtocolVersion != "2" {
-		t.Errorf("expected protocol_version=2, got %s", awg.ProtocolVersion)
+	// Для всей ветки 3.x приложение знает единственное значение protocol_version —
+	// "3.1"; "2" оно считает устаревшим контейнером.
+	if awg.ProtocolVersion != "3.1" {
+		t.Errorf("expected protocol_version=3.1, got %s", awg.ProtocolVersion)
 	}
 	if awg.Params["HeaderProtectionKey"] != "aGVhZGVyS2V5MTIzNDU2Nzg5MA==" {
 		t.Errorf("HeaderProtectionKey не доехал до контейнера: %q", awg.Params["HeaderProtectionKey"])

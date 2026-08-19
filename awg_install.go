@@ -502,8 +502,12 @@ func InstallAWGNative(srv ServerConfig, port int, enableIPv6 bool, ipv6IfaceAddr
 		cfgIfaceAddr = ipv6IfaceAddr
 		cfgClientSubnet = ipv6ClientSubnet
 	}
-	// generateAWGParams выдаёт набор AWG 2.0; HeaderProtectionKey и прочие
-	// параметры 3.0 бот сам не генерирует (см. CLAUDE.md).
+	// generateAWGParams выдаёт набор AWG 2.0 независимо от версии tools на сервере,
+	// и это осознанно: параметры 3.0/3.1 — must-match, а клиент без них не проходит
+	// рукопожатие. Сервер, поднятый с HeaderProtectionKey или RandomTrailers, сразу
+	// отрезает всех клиентов на AWG 1.x/2.x (RouterOS в том числе), а 2.0-конфиг
+	// работает и на модуле 3.x. Админ может дописать параметры 3.x в awg0.conf
+	// вручную — бот их подхватит и зеркалирует клиентам (см. CLAUDE.md).
 	confContent := buildServerConf(serverPrivKey, port, diag.NetIface, awgParams, cfgIfaceAddr, cfgClientSubnet, AWGVersion2)
 	confB64 := base64.StdEncoding.EncodeToString([]byte(confContent))
 	// umask 077 + chmod 600 — как в writeFileOnServer: под дефолтным umask 022

@@ -9,11 +9,16 @@ import (
 
 // AWGVersion — версия протокола AmneziaWG.
 //
-// Значение 15 у ветки 1.5 не опечатка: эта ветка (J1-J3, Itime, I1-I5 отдельными
-// полями) прожила два дня в июле 2025 и была откачена — amneziawg-tools
-// v1.0.20250706, «Reverted AWG 1.5 changes». Она стоит особняком, а не между 1.0
-// и 2.0, поэтому прямые сравнения `<`/`>` для неё бессмысленны: набор параметров
-// версии проверяйте через versionHasParam, а хронологию — через versionRank.
+// Кодировка значения: мажорная версия без минорной — само число (1 → 1.0,
+// 2 → 2.0, 3 → 3.0), с минорной — major*10+minor (15 → 1.5, 31 → 3.1).
+// Значения попадают в config.yaml (`awg_version`), поэтому менять кодировку
+// задним числом нельзя.
+//
+// Ветка 1.5 (J1-J3, Itime, I1-I5 отдельными полями) прожила два дня в июле 2025
+// и была откачена — amneziawg-tools v1.0.20250706, «Reverted AWG 1.5 changes».
+// Она стоит особняком, а не между 1.0 и 2.0, поэтому прямые сравнения `<`/`>`
+// бессмысленны: набор параметров версии проверяйте через versionHasParam,
+// а хронологию — через versionRank.
 type AWGVersion int
 
 const (
@@ -22,35 +27,53 @@ const (
 	AWGVersion15      AWGVersion = 15 // тупиковая ветка июля 2025: I1-I5, J1-J3, Itime
 	AWGVersion2       AWGVersion = 2  // S3/S4, H1-H4 диапазонами, I1-I5 в виде CPS-тегов
 	AWGVersion3       AWGVersion = 3  // HeaderProtectionKey, ContentPaddingAddition, тайминги
+	AWGVersion31      AWGVersion = 31 // RandomTrailers, DisableCookies (tools v3.1.20260812)
 )
 
-// String — человекочитаемое имя версии для UI.
-func (v AWGVersion) String() string {
-	switch v {
-	case AWGVersionUnknown:
-		return "AWG ?"
-	case AWGVersion15:
-		return "AWG 1.5"
-	default:
-		return fmt.Sprintf("AWG %d.0", int(v))
+// versionParts раскладывает значение на мажорную и минорную часть.
+func versionParts(v AWGVersion) (major, minor int) {
+	if v < 10 {
+		return int(v), 0
 	}
+	return int(v) / 10, int(v) % 10
 }
 
-// versionRank — порядок версий по времени выпуска (1.0 → 1.5 → 2.0 → 3.0 → …).
-// Нужен потому, что числовое значение AWGVersion15 выбивается из хронологии.
-func versionRank(v AWGVersion) int {
-	switch v {
-	case AWGVersionUnknown:
-		return 0
-	case AWGVersion1:
-		return 1
-	case AWGVersion15:
-		return 2
-	case AWGVersion2:
-		return 3
-	default:
-		return int(v) + 1 // 3.0 → 4, будущие мажорные версии — по возрастанию
+// awgVersionFromParts — обратная операция: (3, 1) → AWGVersion31.
+func awgVersionFromParts(major, minor int) AWGVersion {
+	if major < 1 {
+		// wireguard-tools 0.x — до-AWG эпоха, набор параметров тот же, что у 1.0.
+		return AWGVersion1
 	}
+	if minor <= 0 {
+		return AWGVersion(major)
+	}
+	if minor > 9 {
+		// Кодировка major*10+minor двузначных миноров не вмещает. Такой нумерации
+		// у AWG не было; подрезаем, чтобы версия осталась в своей мажорной ветке
+		// и не уехала рангом ниже более ранних релизов.
+		minor = 9
+	}
+	return AWGVersion(major*10 + minor)
+}
+
+// versionRank — порядок версий по времени выпуска (1.0 → 1.5 → 2.0 → 3.0 → 3.1 → …).
+// Нужен потому, что числовое значение AWGVersion15 и AWGVersion31 выбивается из
+// хронологии: 15 стоит между 1 и 2, а 31 — сразу за 3.
+func versionRank(v AWGVersion) int {
+	if v == AWGVersionUnknown {
+		return 0
+	}
+	major, minor := versionParts(v)
+	return major*10 + minor // 1.0 → 10, 1.5 → 15, 2.0 → 20, 3.0 → 30, 3.1 → 31
+}
+
+// String — человекочитаемое имя версии для UI: «AWG 2.0», «AWG 3.1».
+func (v AWGVersion) String() string {
+	if v == AWGVersionUnknown {
+		return "AWG ?"
+	}
+	major, minor := versionParts(v)
+	return fmt.Sprintf("AWG %d.%d", major, minor)
 }
 
 // minAWGVersion возвращает более раннюю из двух версий.
@@ -86,6 +109,25 @@ var awgParamSpecs = []awgParamSpec{
 	{"RekeyAfterTime", AWGVersion3, true}, {"RekeyTimeout", AWGVersion3, true},
 	{"RejectAfterTime", AWGVersion3, true}, {"KeepaliveTimeout", AWGVersion3, true},
 	{"MaxHandshakeAttempts", AWGVersion3, true},
+	{"RandomTrailers", AWGVersion31, true}, {"DisableCookies", AWGVersion31, true},
+}
+
+// awgBoolParams — параметры-тумблеры (parse_bool в config.c: on/off или 0/1).
+// Их значение — не число и не диапазон, поэтому эвристики версии обрабатывают
+// их отдельно.
+var awgBoolParams = map[string]bool{
+	"RandomTrailers": true, "DisableCookies": true,
+}
+
+// awgToggleEnabled — включён ли тумблер. «off», «0» и пустая строка считаются
+// выключенными: так же их трактует приложение AmneziaVPN (isAwgToggleEnabled в
+// awgProtocolConfig.cpp), и выключенный тумблер не делает конфиг конфигом 3.1.
+func awgToggleEnabled(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "", "off", "0":
+		return false
+	}
+	return true
 }
 
 // awgParamMinVer — индекс awgParamSpecs по каноническому имени ключа.
@@ -131,7 +173,7 @@ func versionHasParam(v, minVer AWGVersion) bool {
 	if minVer == AWGVersion15 {
 		return false
 	}
-	return minVer <= v
+	return versionRank(minVer) <= versionRank(v)
 }
 
 // rangeValueRe — значение вида "100-200" (диапазон H-параметров в AWG 2.0).
@@ -144,10 +186,25 @@ func deriveConfigVersion(params *ServerParams) AWGVersion {
 		return AWGVersionUnknown
 	}
 
-	for key := range params.AWGParams {
-		if awgParamMinVer[key] == AWGVersion3 {
-			return AWGVersion3
+	// Версии 3.0+ определяются по самому позднему из присутствующих параметров:
+	// набор растёт от версии к версии, и одного RandomTrailers достаточно, чтобы
+	// конфиг был конфигом 3.1. Параметры 1.0-2.0 сюда не входят — по ним версия
+	// определяется эвристиками ниже (I1-I5 живут и в 1.5, и в 2.0).
+	best := AWGVersionUnknown
+	for key, val := range params.AWGParams {
+		minVer, known := awgParamMinVer[key]
+		if !known || versionRank(minVer) < versionRank(AWGVersion3) {
+			continue
 		}
+		if awgBoolParams[key] && !awgToggleEnabled(val) {
+			continue
+		}
+		if versionRank(minVer) > versionRank(best) {
+			best = minVer
+		}
+	}
+	if best != AWGVersionUnknown {
+		return best
 	}
 
 	if _, ok := params.AWGParams["S3"]; ok {
@@ -254,14 +311,10 @@ func matchVersion(re *regexp.Regexp, out string) (AWGVersion, string) {
 		raw += "." + m[3]
 	}
 
-	switch {
-	case major == 1 && minor == 5:
-		return AWGVersion15, raw
-	case major <= 1:
-		return AWGVersion1, raw
-	default:
-		return AWGVersion(major), raw
-	}
+	// Минорная версия значима: 3.1 добавила RandomTrailers/DisableCookies, а 1.5
+	// вообще стоит особняком. Схлопывать её к мажорной нельзя — иначе сервер с
+	// tools 3.1 выглядел бы как 3.0 и в UI, и в versionHasParam.
+	return awgVersionFromParts(major, minor), raw
 }
 
 // parseAWGVersionOutput — чистая часть detectAWGVersion: сводит версии tools и

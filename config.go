@@ -25,8 +25,8 @@ type ServerConfig struct {
 	IPv6Subnet    string    `yaml:"ipv6_subnet,omitempty"`       // VPN IPv6 client subnet CIDR (e.g. 2a01:db8::4000/114)
 	IPv6IfaceAddr string    `yaml:"ipv6_iface_addr,omitempty"`   // AWG interface IPv6 address (e.g. 2a01:db8::1/64), empty = same as IPv6Subnet
 	Iface         string    `yaml:"iface,omitempty"`             // имя AWG-интерфейса, awg0 по умолчанию
-	AWGVersion    int       `yaml:"awg_version,omitempty"`       // 1/15/2/3 — кэш детекта версии протокола
-	AWGToolsVer   string    `yaml:"awg_tools_version,omitempty"` // "3.0.20260730" — для показа в UI
+	AWGVersion    int       `yaml:"awg_version,omitempty"`       // 1/15/2/3/31 — кэш детекта версии протокола (major*10+minor у минорных)
+	AWGToolsVer   string    `yaml:"awg_tools_version,omitempty"` // "3.1.20260812" — для показа в UI
 	DNS           string    `yaml:"dns,omitempty"`               // DNS для клиентских конфигов (через запятую)
 }
 
