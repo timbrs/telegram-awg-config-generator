@@ -38,6 +38,7 @@ const (
 	ScreenInstallPort                // waiting for port input
 	ScreenInstallIPv6                // "Enable IPv6?"
 	ScreenInstallProgress            // installation in progress
+	ScreenVersionScan                // опрос версий AWG на серверах
 )
 
 // UserSession tracks the current UI state for a user.
@@ -74,6 +75,33 @@ type UserSession struct {
 	PendingIPv6Subnet    string // computed VPN IPv6 client subnet CIDR
 	PendingIPv6IfaceAddr string // computed AWG interface IPv6 address
 	PendingNetIface      string // detected network interface
+	// Опрос версий AWG («🔄 Проверить версии AWG»): идёт в отдельной горутине,
+	// минутами, и должен прерываться кнопкой.
+	VerScanID     int  // номер текущего опроса; новый опрос отменяет предыдущий
+	VerScanCancel bool // выставляется кнопкой «Прервать»
+}
+
+// startVerScan объявляет начало нового опроса версий и возвращает его номер.
+func (s *UserSession) startVerScan() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.VerScanID++
+	s.VerScanCancel = false
+	return s.VerScanID
+}
+
+func (s *UserSession) cancelVerScan() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.VerScanCancel = true
+}
+
+// verScanStopped — прерван ли опрос с номером id: кнопкой или тем, что
+// пользователь успел запустить следующий.
+func (s *UserSession) verScanStopped(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.VerScanCancel || s.VerScanID != id
 }
 
 func (s *UserSession) screen() Screen {
@@ -135,6 +163,7 @@ var (
 	btnServerRename = tele.InlineButton{Unique: "svrn"}
 	btnServerRenSel = tele.InlineButton{Unique: "svr"}
 	btnServerVer    = tele.InlineButton{Unique: "svv"}
+	btnVerScanStop  = tele.InlineButton{Unique: "svvs"}
 	btnPagePrev     = tele.InlineButton{Unique: "ppv"}
 	btnPageNext     = tele.InlineButton{Unique: "pnx"}
 	btnNoop         = tele.InlineButton{Unique: "noop"}
@@ -232,6 +261,7 @@ func (b *Bot) Start() {
 	b.bot.Handle(&btnServerRename, b.cbServerRename)
 	b.bot.Handle(&btnServerRenSel, b.cbServerRenameSelect)
 	b.bot.Handle(&btnServerVer, b.cbRefreshVersion)
+	b.bot.Handle(&btnVerScanStop, b.cbStopVersionScan)
 	b.bot.Handle(&btnPagePrev, b.cbPagePrev)
 	b.bot.Handle(&btnPageNext, b.cbPageNext)
 	b.bot.Handle(&btnNoop, func(c tele.Context) error { return c.Respond() })
@@ -651,7 +681,9 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 		markup.Data("👥 Админы", btnAdminList.Unique),
 		markup.Data("✏️ Переименовать", btnServerRename.Unique),
 	})
-	rows = append(rows, tele.Row{markup.Data("🔄 Обновить версию", btnServerVer.Unique)})
+	// Не «обновить версию»: так кнопка читается как апгрейд AWG на серверах.
+	// Бот только опрашивает серверы и обновляет свой кэш.
+	rows = append(rows, tele.Row{markup.Data("🔄 Проверить версии AWG", btnServerVer.Unique)})
 	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
 	markup.Inline(rows...)
 
@@ -684,22 +716,43 @@ func modeLabel(mode string) string {
 	return "Docker"
 }
 
-// versionLabel — «AWG 3.0 (tools 3.0.20260730)» для экрана добавления сервера.
+// versionLabel — «AWG 3.1 (tools 3.1.20260812)» для экрана добавления сервера.
 func versionLabel(info AWGVersionInfo) string {
 	if info.Version == AWGVersionUnknown {
 		return "не определена"
 	}
 	label := info.Version.String()
-	if info.ToolsRaw != "" {
+	switch {
+	case info.FromConfig && info.ToolsRaw != "":
+		// Инструменты назвались старее, чем набор параметров в конфиге. Так почти
+		// везде: до июня 2026 `awg --version` печатал 1.0.20210914 при любой
+		// поддерживаемой версии протокола.
+		label += " (по конфигу; awg --version: " + info.ToolsRaw + ")"
+	case info.FromConfig:
+		label += " (по конфигу)"
+	case info.ToolsRaw != "":
 		label += " (tools " + info.ToolsRaw + ")"
 	}
 	return label
 }
 
-// cbRefreshVersion перезапрашивает версию AWG на всех доступных пользователю
-// серверах. Кнопка живёт на экране списка серверов, поэтому обновляет весь
-// список; нужна потому, что версия на сервере меняется независимо от бота
-// (apt upgrade).
+// versionScanHeader — шапка экрана опроса версий. Кнопка называется «Проверить
+// версии», и текст обязан снимать главный страх: бот НИЧЕГО не ставит и не
+// обновляет на серверах, только читает и кладёт результат в свой config.yaml.
+const versionScanHeader = "🔄 Проверка версий AWG\n\n" +
+	"Бот только читает данные с серверов — ничего на них не устанавливает, не обновляет и не перезапускает:\n" +
+	"• awg --version и modinfo amneziawg — версии инструментов и модуля ядра\n" +
+	"• конфиг интерфейса — набор параметров обфускации\n" +
+	"• awg show interfaces — имя интерфейса\n\n" +
+	"Меняется только кэш в config.yaml самого бота: awg_version, awg_tools_version, iface.\n\n"
+
+// cbRefreshVersion перечитывает версию AWG со всех доступных пользователю
+// серверов. Кнопка живёт на экране списка серверов, поэтому обходит весь список;
+// нужна потому, что версия на сервере меняется независимо от бота (apt upgrade).
+//
+// Опрос идёт в отдельной горутине: обработчики telebot для одного пользователя
+// выполняются последовательно, и внутри обработчика нажатие «⛔ Прервать» просто
+// не было бы обработано до конца обхода.
 func (b *Bot) cbRefreshVersion(c tele.Context) error {
 	_ = c.Respond()
 	uid := c.Sender().ID
@@ -711,30 +764,112 @@ func (b *Bot) cbRefreshVersion(c tele.Context) error {
 		return b.showError(s, c.Bot(), fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
 	}
 
-	_ = b.editOrSend(s, c.Bot(), "⏳ Опрашиваю серверы...", nil)
+	s.setScreen(ScreenVersionScan)
+	scanID := s.startVerScan()
+	bot := c.Bot()
 
-	var failed []string
-	for _, idx := range indices {
-		srv := b.cfg.Get().Servers[idx]
+	go b.runVersionScan(s, bot, uid, indices, scanID)
+	return nil
+}
+
+// cbStopVersionScan просит опрос остановиться. Само сообщение перерисует
+// горутина опроса — она дойдёт до ближайшей проверки и покажет итог.
+func (b *Bot) cbStopVersionScan(c tele.Context) error {
+	_ = c.Respond(&tele.CallbackResponse{Text: "Прерываю..."})
+	s := b.getSession(c.Sender().ID, c.Chat().ID)
+	s.cancelVerScan()
+	return nil
+}
+
+// verScanResult — строка итогового отчёта по одному серверу.
+type verScanResult struct {
+	Name string
+	Line string
+}
+
+// runVersionScan обходит серверы по одному, обновляя сообщение прогресса.
+func (b *Bot) runVersionScan(s *UserSession, bot *tele.Bot, uid int64, indices []int, scanID int) {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("⛔ Прервать", btnVerScanStop.Unique)})
+
+	var done []verScanResult
+	stopped := false
+
+	for i, idx := range indices {
+		if s.verScanStopped(scanID) {
+			stopped = true
+			break
+		}
+
+		cfg := b.cfg.Get()
+		if idx >= len(cfg.Servers) {
+			continue // конфиг перечитали, и сервера уже нет
+		}
+		srv := cfg.Servers[idx]
+
+		progress := fmt.Sprintf("%s⏳ %d из %d: %s (%s)", versionScanHeader, i+1, len(indices), srv.Name, srv.IP)
+		if len(done) > 0 {
+			progress += "\n\nГотово:\n" + resultLines(done)
+		}
+		_ = b.editOrSend(s, bot, progress, markup)
+
 		info, err := detectAWGVersion(srv)
 		if err != nil {
 			log.Printf("детект версии AWG (%s): %v", srv.Name, err)
-			failed = append(failed, srv.Name)
+			done = append(done, verScanResult{srv.Name, fmt.Sprintf("⚠️ %s — не удалось опросить", srv.Name)})
 			continue
 		}
-		if err := b.cfg.SetAWGInfo(idx, info, refreshedIface(srv)); err != nil {
+		iface := refreshedIface(srv)
+		if err := b.cfg.SetAWGInfo(idx, info, iface); err != nil {
 			log.Printf("сохранение версии AWG (%s): %v", srv.Name, err)
-			failed = append(failed, srv.Name)
+			done = append(done, verScanResult{srv.Name, fmt.Sprintf("⚠️ %s — не удалось сохранить в config.yaml", srv.Name)})
+			continue
 		}
+		done = append(done, verScanResult{srv.Name, fmt.Sprintf("• %s — %s · %s\n   %s", srv.Name, info.Version, iface, versionSource(info))})
 	}
 
-	if len(failed) > 0 {
-		markup := &tele.ReplyMarkup{}
-		markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
-		text := "⚠️ Не удалось определить версию AWG: " + strings.Join(failed, ", ")
-		return b.editOrSend(s, c.Bot(), text, markup)
+	// Экран мог смениться, пока шёл опрос: пользователь ушёл в другое меню.
+	if s.screen() != ScreenVersionScan {
+		return
 	}
-	return b.showServerList(s, c.Bot(), uid)
+
+	back := &tele.ReplyMarkup{}
+	back.Inline(tele.Row{back.Data("↩ К серверам", btnServerList.Unique)})
+
+	var text string
+	switch {
+	case stopped && len(done) == 0:
+		text = "⛔ Проверка прервана. Ни один сервер опросить не успели."
+	case stopped:
+		text = fmt.Sprintf("⛔ Проверка прервана. Успели опросить %d из %d:\n\n%s", len(done), len(indices), resultLines(done))
+	default:
+		text = fmt.Sprintf("✅ Готово, опрошено серверов: %d\n\n%s\n\nСведения сохранены в config.yaml бота.", len(done), resultLines(done))
+	}
+	_ = b.editOrSend(s, bot, text, back)
+}
+
+// versionSource — откуда взялась цифра версии: из `awg --version` или из набора
+// параметров конфига (инструменты почти везде называются 1.0.20210914).
+func versionSource(info AWGVersionInfo) string {
+	tools := info.ToolsRaw
+	if tools == "" {
+		tools = "нет ответа"
+	}
+	if info.FromConfig {
+		return "определена по параметрам конфига; awg --version: " + tools
+	}
+	if info.KmodRaw != "" {
+		return "tools " + tools + ", модуль ядра " + info.KmodRaw
+	}
+	return "tools " + tools
+}
+
+func resultLines(done []verScanResult) string {
+	lines := make([]string, 0, len(done))
+	for _, r := range done {
+		lines = append(lines, r.Line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // refreshedIface — имя интерфейса по факту. Обновляем его только если интерфейс

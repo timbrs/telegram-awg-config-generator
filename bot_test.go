@@ -2,6 +2,30 @@ package main
 
 import "testing"
 
+// Подписи версии должны честно говорить, откуда взялась цифра: иначе «AWG 2.0»
+// на сервере, где `awg --version` печатает 1.0.20210914, выглядит ошибкой бота.
+func TestVersionLabelAndSource(t *testing.T) {
+	fromCfg := AWGVersionInfo{Version: AWGVersion2, ToolsRaw: "1.0.20210914", FromConfig: true}
+	if got := versionLabel(fromCfg); got != "AWG 2.0 (по конфигу; awg --version: 1.0.20210914)" {
+		t.Errorf("versionLabel = %q", got)
+	}
+	if got := versionSource(fromCfg); got != "определена по параметрам конфига; awg --version: 1.0.20210914" {
+		t.Errorf("versionSource = %q", got)
+	}
+
+	native := AWGVersionInfo{Version: AWGVersion31, ToolsRaw: "3.1.20260812", KmodRaw: "3.1.20260812-01"}
+	if got := versionLabel(native); got != "AWG 3.1 (tools 3.1.20260812)" {
+		t.Errorf("versionLabel = %q", got)
+	}
+	if got := versionSource(native); got != "tools 3.1.20260812, модуль ядра 3.1.20260812-01" {
+		t.Errorf("versionSource = %q", got)
+	}
+
+	if got := versionLabel(AWGVersionInfo{}); got != "не определена" {
+		t.Errorf("versionLabel для неизвестной версии = %q", got)
+	}
+}
+
 func TestIsSuperAdmin(t *testing.T) {
 	srv := ServerConfig{
 		AllowedUIDs: []int64{100, 200, 300},

@@ -1030,6 +1030,39 @@ func TestParseAWGVersionOutputTakesMin(t *testing.T) {
 	}
 }
 
+// Версия из `awg --version` систематически занижена: src/version.h в
+// amneziawg-tools не трогали с сентября 2021 по июнь 2026, и контейнер
+// AmneziaVPN с полноценным AWG 2.0 называется «amneziawg-tools v1.0.20210914».
+// Набор параметров конфига должен такую версию поднимать.
+func TestWithConfigVersion(t *testing.T) {
+	tools10 := AWGVersionInfo{Version: AWGVersion1, ToolsRaw: "1.0.20210914"}
+
+	got := withConfigVersion(tools10, AWGVersion2)
+	if got.Version != AWGVersion2 || !got.FromConfig {
+		t.Errorf("конфиг 2.0 должен поднять версию до 2.0 с пометкой FromConfig, получено %v (FromConfig=%v)", got.Version, got.FromConfig)
+	}
+	if got.ToolsRaw != "1.0.20210914" {
+		t.Errorf("сырая версия tools должна сохраниться, получено %q", got.ToolsRaw)
+	}
+
+	// Понижать нельзя: конфиг 2.0 на сервере с tools 3.1 значит лишь, что админ
+	// не включил параметры 3.x.
+	tools31 := AWGVersionInfo{Version: AWGVersion31, ToolsRaw: "3.1.20260812"}
+	if got := withConfigVersion(tools31, AWGVersion2); got.Version != AWGVersion31 || got.FromConfig {
+		t.Errorf("версия tools 3.1 не должна опускаться до конфига 2.0, получено %v (FromConfig=%v)", got.Version, got.FromConfig)
+	}
+
+	// Конфиг без AWG-параметров ничего не сообщает о версии.
+	if got := withConfigVersion(tools10, AWGVersionUnknown); got.Version != AWGVersion1 || got.FromConfig {
+		t.Errorf("пустой конфиг не должен менять версию, получено %v (FromConfig=%v)", got.Version, got.FromConfig)
+	}
+
+	// Сервер не ответил на `awg --version` — версия целиком из конфига.
+	if got := withConfigVersion(AWGVersionInfo{}, AWGVersion31); got.Version != AWGVersion31 || !got.FromConfig {
+		t.Errorf("без ответа tools версия должна прийти из конфига, получено %v (FromConfig=%v)", got.Version, got.FromConfig)
+	}
+}
+
 // Хронология версий: 1.0 → 1.5 → 2.0 → 3.0 → 3.1. Значение AWGVersion15 и
 // AWGVersion31 выбиваются из неё числом, поэтому порядок даёт только versionRank.
 func TestVersionRankAndString(t *testing.T) {

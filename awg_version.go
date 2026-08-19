@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -271,8 +272,30 @@ func serverParamOrder(v AWGVersion) []string {
 // AWGVersionInfo — то, что удалось выяснить о версии AWG на сервере.
 type AWGVersionInfo struct {
 	Version  AWGVersion
-	ToolsRaw string // "3.0.20260730"
-	KmodRaw  string // "3.0.20260731-04"; пусто в docker (там userspace amneziawg-go)
+	ToolsRaw string // "3.1.20260812"
+	KmodRaw  string // "3.1.20260812-01"; пусто в docker (там userspace amneziawg-go)
+	// FromConfig — версию подняли по набору параметров в awg0.conf, потому что
+	// `awg --version` назвался более старым. Нужно для UI: показать, откуда цифра.
+	FromConfig bool
+}
+
+// withConfigVersion сводит версию, названную инструментами, с той, что следует
+// из набора параметров конфига.
+//
+// Версию можно только поднять. `awg --version` систематически занижает её:
+// src/version.h в amneziawg-tools не трогали с сентября 2021 по июнь 2026, и всё
+// это время инструменты печатали «amneziawg-tools v1.0.20210914» — в том числе в
+// контейнерах AmneziaVPN с полноценным AWG 2.0. Конфиг честнее: awg-quick с
+// S3/S4 не поднял бы интерфейс на инструментах и модуле, которые их не знают.
+//
+// Понижать нельзя: конфиг 2.0 на сервере с tools 3.1 означает лишь, что админ не
+// включил параметры 3.x, а не что сервер их не умеет.
+func withConfigVersion(info AWGVersionInfo, cfgVer AWGVersion) AWGVersionInfo {
+	if versionRank(cfgVer) > versionRank(info.Version) {
+		info.Version = cfgVer
+		info.FromConfig = true
+	}
+	return info
 }
 
 var (
@@ -348,14 +371,25 @@ func parseAWGVersionOutput(out string) AWGVersionInfo {
 // `awg --version`, из-за чего версия на docker-серверах не определялась бы никогда.
 const awgVersionProbeCmd = `sh -c 'awg --version 2>/dev/null; modinfo amneziawg 2>/dev/null | grep "^version:"; true'`
 
-// detectAWGVersion опрашивает сервер ОДНОЙ командой: каждая SSH-сессия — это
-// новый Dial (SSHRunTimeout, ssh.go), лишние обходятся дорого.
+// detectAWGVersion опрашивает сервер: версии tools и модуля ядра — одной
+// командой (каждая SSH-сессия — это новый Dial, SSHRunTimeout в ssh.go), плюс
+// чтение конфига, чтобы поднять заниженную версию инструментов (withConfigVersion).
+//
+// Детект вызывается только при добавлении сервера и по кнопке «Проверить версии»,
+// на горячем пути (AddPeer, showStatus) версия берётся из кэша в config.yaml.
 func detectAWGVersion(srv ServerConfig) (AWGVersionInfo, error) {
 	out, err := execAWG(srv, awgVersionProbeCmd)
 	if err != nil {
 		return AWGVersionInfo{}, fmt.Errorf("определение версии AWG: %w", err)
 	}
 	info := parseAWGVersionOutput(out)
+
+	if params, cfgErr := ReadServerConfig(srv); cfgErr == nil {
+		info = withConfigVersion(info, params.Version)
+	} else {
+		log.Printf("AWG (%s): конфиг не прочитан, версия только по awg --version: %v", srv.Name, cfgErr)
+	}
+
 	if info.Version == AWGVersionUnknown {
 		return info, fmt.Errorf("не удалось разобрать версию AWG: %s", strings.TrimSpace(out))
 	}
