@@ -39,6 +39,9 @@ const (
 	ScreenInstallIPv6                // "Enable IPv6?"
 	ScreenInstallProgress            // installation in progress
 	ScreenVersionScan                // опрос версий AWG на серверах
+	ScreenRandomPortPick             // выбор сервера для настройки «случайного порта»
+	ScreenRandomPort                 // экран режима «случайный порт»
+	ScreenRandomPortRange            // ввод диапазона портов
 )
 
 // UserSession tracks the current UI state for a user.
@@ -79,6 +82,8 @@ type UserSession struct {
 	// минутами, и должен прерываться кнопкой.
 	VerScanID     int  // номер текущего опроса; новый опрос отменяет предыдущий
 	VerScanCancel bool // выставляется кнопкой «Прервать»
+	// Режим «случайный порт»
+	PendingRandomPortIdx int // индекс сервера, который настраивается
 }
 
 // startVerScan объявляет начало нового опроса версий и возвращает его номер.
@@ -164,9 +169,15 @@ var (
 	btnServerRenSel = tele.InlineButton{Unique: "svr"}
 	btnServerVer    = tele.InlineButton{Unique: "svv"}
 	btnVerScanStop  = tele.InlineButton{Unique: "svvs"}
-	btnPagePrev     = tele.InlineButton{Unique: "ppv"}
-	btnPageNext     = tele.InlineButton{Unique: "pnx"}
-	btnNoop         = tele.InlineButton{Unique: "noop"}
+	// Режим «случайный порт»
+	btnRandomPort       = tele.InlineButton{Unique: "rp"}
+	btnRandomPortSel    = tele.InlineButton{Unique: "rps"}
+	btnRandomPortToggle = tele.InlineButton{Unique: "rpt"}
+	btnRandomPortRange  = tele.InlineButton{Unique: "rpr"}
+	btnRandomPortBack   = tele.InlineButton{Unique: "rpb"}
+	btnPagePrev         = tele.InlineButton{Unique: "ppv"}
+	btnPageNext         = tele.InlineButton{Unique: "pnx"}
+	btnNoop             = tele.InlineButton{Unique: "noop"}
 	// Add-server
 	btnAddServer = tele.InlineButton{Unique: "asv"}
 	// Admin management
@@ -213,6 +224,41 @@ func NewBot(cfg *ConfigManager) (*Bot, error) {
 	}, nil
 }
 
+// rememberUser запоминает ник и имя пользователя при любом обращении к боту —
+// в списках админов UID сам по себе ничего не говорит.
+func (b *Bot) rememberUser(u *tele.User) {
+	if u == nil || u.ID == 0 {
+		return
+	}
+	if !b.state.SeeUser(u.ID, u.Username, fullName(u.FirstName, u.LastName)) {
+		return // ничего не изменилось — не трогаем диск
+	}
+	if err := b.state.Save(); err != nil {
+		log.Printf("Сохранение профиля пользователя %d: %v", u.ID, err)
+	}
+}
+
+func fullName(first, last string) string {
+	return strings.TrimSpace(strings.TrimSpace(first) + " " + strings.TrimSpace(last))
+}
+
+// userTag — «123456 (@nick, Иван)» для списков админов.
+func (b *Bot) userTag(uid int64) string {
+	if label := b.state.UserLabel(uid); label != "" {
+		return fmt.Sprintf("%d (%s)", uid, label)
+	}
+	return strconv.FormatInt(uid, 10)
+}
+
+// userShortTag — «@nick» или имя, а если о человеке ничего не известно — UID.
+// Для строки ключа в статусе, где место ограничено.
+func (b *Bot) userShortTag(uid int64) string {
+	if short := b.state.UserShort(uid); short != "" {
+		return short
+	}
+	return strconv.FormatInt(uid, 10)
+}
+
 func (b *Bot) getSession(uid, chatID int64) *UserSession {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -235,6 +281,7 @@ func (b *Bot) Start() {
 			if err := b.cfg.CheckReload(); err != nil {
 				log.Printf("Ошибка перезагрузки конфига: %v", err)
 			}
+			b.rememberUser(c.Sender())
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("PANIC в обработчике: %v", r)
@@ -262,6 +309,11 @@ func (b *Bot) Start() {
 	b.bot.Handle(&btnServerRenSel, b.cbServerRenameSelect)
 	b.bot.Handle(&btnServerVer, b.cbRefreshVersion)
 	b.bot.Handle(&btnVerScanStop, b.cbStopVersionScan)
+	b.bot.Handle(&btnRandomPort, b.cbRandomPort)
+	b.bot.Handle(&btnRandomPortSel, b.cbRandomPortSelect)
+	b.bot.Handle(&btnRandomPortToggle, b.cbRandomPortToggle)
+	b.bot.Handle(&btnRandomPortRange, b.cbRandomPortRange)
+	b.bot.Handle(&btnRandomPortBack, b.cbRandomPortBack)
 	b.bot.Handle(&btnPagePrev, b.cbPagePrev)
 	b.bot.Handle(&btnPageNext, b.cbPageNext)
 	b.bot.Handle(&btnNoop, func(c tele.Context) error { return c.Respond() })
@@ -287,6 +339,7 @@ func (b *Bot) Start() {
 	})
 
 	b.startReportScheduler()
+	b.startProfileRefresher()
 
 	log.Println("Бот запущен")
 	b.bot.Start()
@@ -541,10 +594,15 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig, uid in
 			}
 			icon := statusIcon(handshake)
 			line := fmt.Sprintf("#%d %s  %s%s  ↓%s ↑%s", cl.ID, cl.UserData.ClientName, icon, formatHandshake(handshake), rx, tx)
+			// Ключ выдан в режиме «случайный порт» — показываем его порт: без
+			// этого непонятно, почему у ключей разные Endpoint.
+			if cl.UserData.ClientPort != 0 {
+				line += fmt.Sprintf("  🔌%d", cl.UserData.ClientPort)
+			}
 			// Суперадмину показываем владельца ключа.
 			if super {
 				if cl.UserData.CreatorUID != 0 {
-					line += fmt.Sprintf("  👤%d", cl.UserData.CreatorUID)
+					line += "  👤" + b.userShortTag(cl.UserData.CreatorUID)
 				} else {
 					line += "  👤—"
 				}
@@ -684,6 +742,7 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 	// Не «обновить версию»: так кнопка читается как апгрейд AWG на серверах.
 	// Бот только опрашивает серверы и обновляет свой кэш.
 	rows = append(rows, tele.Row{markup.Data("🔄 Проверить версии AWG", btnServerVer.Unique)})
+	rows = append(rows, tele.Row{markup.Data("🎲 Случайный порт", btnRandomPort.Unique)})
 	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
 	markup.Inline(rows...)
 
@@ -870,6 +929,250 @@ func resultLines(done []verScanResult) string {
 		lines = append(lines, r.Line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// --- Режим «случайный порт» ---
+
+func (b *Bot) cbRandomPort(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	return b.showRandomPortPick(s, c.Bot(), uid)
+}
+
+func (b *Bot) showRandomPortPick(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.setScreen(ScreenRandomPortPick)
+
+	indices := b.cfg.ServersForUser(uid)
+	if len(indices) == 0 {
+		return b.showError(s, bot, fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
+	}
+	cfg := b.cfg.Get()
+
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for i, idx := range indices {
+		srv := cfg.Servers[idx]
+		state := "выкл"
+		if srv.RandomPort {
+			state = fmt.Sprintf("вкл, блоков: %d", len(srv.RandomPortBlocks))
+		}
+		rows = append(rows, tele.Row{markup.Data(fmt.Sprintf("%s — %s", srv.Name, state), btnRandomPortSel.Unique, strconv.Itoa(i+1))})
+	}
+	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
+	markup.Inline(rows...)
+
+	return b.editOrSend(s, bot, "🎲 Случайный порт — выберите сервер:", markup)
+}
+
+func (b *Bot) cbRandomPortSelect(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	num, err := strconv.Atoi(strings.TrimSpace(c.Callback().Data))
+	if err != nil {
+		return b.showError(s, c.Bot(), "❌ Ошибка выбора сервера.")
+	}
+	indices := b.cfg.ServersForUser(uid)
+	if num < 1 || num > len(indices) {
+		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Укажите номер от 1 до %d.", len(indices)))
+	}
+
+	s.withLock(func() { s.PendingRandomPortIdx = indices[num-1] })
+	return b.showRandomPort(s, c.Bot(), uid)
+}
+
+func (b *Bot) cbRandomPortBack(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	return b.showRandomPort(s, c.Bot(), uid)
+}
+
+// randomPortTargetServer — сервер, который сейчас настраивается, с проверкой
+// прав на каждое действие: индекс живёт в сессии и переживает перезагрузку
+// конфига, а его нулевое значение — валидный индекс первого сервера.
+func (b *Bot) randomPortTargetServer(s *UserSession, uid int64) (int, ServerConfig, error) {
+	idx := 0
+	s.withLock(func() { idx = s.PendingRandomPortIdx })
+
+	cfg := b.cfg.Get()
+	if idx < 0 || idx >= len(cfg.Servers) {
+		return 0, ServerConfig{}, fmt.Errorf("❌ Сервер не найден")
+	}
+	srv := cfg.Servers[idx]
+	for _, allowed := range srv.AllowedUIDs {
+		if allowed == uid {
+			return idx, srv, nil
+		}
+	}
+	return 0, ServerConfig{}, fmt.Errorf("❌ Нет доступа к этому серверу.\nВаш UID: %d", uid)
+}
+
+func (b *Bot) showRandomPort(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.setScreen(ScreenRandomPort)
+
+	_, srv, err := b.randomPortTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, bot, err.Error())
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🎲 Случайный порт — %s\n\n", srv.Name))
+
+	if srv.RandomPort {
+		sb.WriteString("Состояние: ✅ включён\n")
+		if len(srv.RandomPortBlocks) > 0 {
+			sb.WriteString(fmt.Sprintf("Блоки портов (%d × %d): %s\n",
+				len(srv.RandomPortBlocks), portBlockSize, strings.Join(srv.RandomPortBlocks, ", ")))
+		}
+		unitActive, chainOK, statusErr := RandomPortStatus(srv)
+		switch {
+		case statusErr != nil:
+			sb.WriteString("На сервере: не удалось проверить (сервер недоступен?)\n")
+		case unitActive && chainOK:
+			sb.WriteString("На сервере: правила стоят, служба активна\n")
+		case chainOK:
+			sb.WriteString("На сервере: правила стоят, но служба неактивна — после перезагрузки они пропадут\n")
+		default:
+			sb.WriteString("На сервере: ⚠️ правил нет. Нажмите «Переприменить»\n")
+		}
+	} else {
+		sb.WriteString("Состояние: выключен\n")
+	}
+	sb.WriteString(fmt.Sprintf("Пул для выбора блоков: %s\n", srv.PortRange()))
+
+	sb.WriteString(fmt.Sprintf("\nЧто делает: бот выбирает %d случайных блоков по %d портов, "+
+		"проверяет, что там никто не слушает, и пробрасывает их на AWG. "+
+		"Каждый новый ключ получает свой случайный порт из этих блоков — "+
+		"один и тот же порт у всех заметен для DPI.\n\n", portBlockCount, portBlockSize))
+	sb.WriteString("Как устроено: правила DNAT в цепочке " + randomPortChain + " (nat/PREROUTING), " +
+		"их ставит systemd-юнит " + randomPortUnitName + " — они переживают перезагрузку. " +
+		"Порты, которые кто-то слушает (и сам AWG), из перехвата исключаются при каждом старте.\n\n")
+	sb.WriteString("⚠️ Если перед сервером есть облачный фаервол (Oracle, AWS, Hetzner), " +
+		"диапазон нужно открыть и там.\n")
+	if srv.RandomPort {
+		sb.WriteString("⚠️ При выключении режима ключи, выданные со случайным портом, перестанут подключаться.\n")
+	}
+
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	if srv.RandomPort {
+		rows = append(rows, tele.Row{
+			markup.Data("⛔ Выключить", btnRandomPortToggle.Unique, "off"),
+			markup.Data("🔁 Переприменить", btnRandomPortToggle.Unique, "on"),
+		})
+		rows = append(rows, tele.Row{markup.Data("🎲 Перевыбрать блоки", btnRandomPortToggle.Unique, "reroll")})
+	} else {
+		rows = append(rows, tele.Row{markup.Data("✅ Включить", btnRandomPortToggle.Unique, "on")})
+	}
+	rows = append(rows, tele.Row{markup.Data("✏️ Пул портов", btnRandomPortRange.Unique)})
+	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnRandomPort.Unique)})
+	markup.Inline(rows...)
+
+	return b.editOrSend(s, bot, sb.String(), markup)
+}
+
+func (b *Bot) cbRandomPortToggle(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	idx, srv, err := b.randomPortTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	switch strings.TrimSpace(c.Callback().Data) {
+	case "off":
+		_ = b.editOrSend(s, c.Bot(), "⏳ Снимаю правила с сервера...", nil)
+		if err := DisableRandomPort(srv); err != nil {
+			return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+		}
+		if err := b.cfg.SetRandomPort(idx, false, "", nil); err != nil {
+			return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+		}
+	case "reroll":
+		// Перевыбор блоков: ключи, выданные на старых портах, перестанут работать.
+		_ = b.editOrSend(s, c.Bot(), "⏳ Выбираю новые блоки портов...", nil)
+		if err := b.applyRandomPort(idx, srv, nil); err != nil {
+			return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+		}
+	default: // "on" — включение и переприменение
+		_ = b.editOrSend(s, c.Bot(), "⏳ Ставлю правила на сервер...", nil)
+		if err := b.applyRandomPort(idx, srv, parsePortBlocks(srv.RandomPortBlocks)); err != nil {
+			return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+		}
+	}
+	return b.showRandomPort(s, c.Bot(), uid)
+}
+
+// applyRandomPort ставит правила на сервер и сохраняет выбранные блоки.
+// reuse — блоки, которые стоит сохранить, если они всё ещё свободны (иначе уже
+// выданные ключи с их портами перестанут подключаться); nil — выбрать заново.
+func (b *Bot) applyRandomPort(idx int, srv ServerConfig, reuse []portBlock) error {
+	blocks, err := EnableRandomPort(srv, srv.PortRange(), reuse)
+	if err != nil {
+		return err
+	}
+	return b.cfg.SetRandomPort(idx, true, srv.PortRange(), blockSpecs(blocks))
+}
+
+func (b *Bot) cbRandomPortRange(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	_, srv, err := b.randomPortTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	s.setScreen(ScreenRandomPortRange)
+	text := fmt.Sprintf("✏️ Пул портов для %s\n\nСейчас: %s\n\n"+
+		"Введите новый в формате 20000-32767. Из пула бот нарежет %d свободных блоков по %d портов — "+
+		"пробрасываются только они, а не весь пул.\n\n"+
+		"По умолчанию пул заканчивается на 32767: дальше начинается эфемерный "+
+		"диапазон ядра (исходящие соединения самого сервера), и хотя DNAT их не ломает, "+
+		"новый UDP-сервис на таком порту попал бы под перехват.",
+		srv.Name, srv.PortRange(), portBlockCount, portBlockSize)
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnRandomPortBack.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleRandomPortRange(c tele.Context, s *UserSession, input string) error {
+	uid := c.Sender().ID
+	idx, srv, err := b.randomPortTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	rangeSpec := strings.TrimSpace(input)
+	if _, _, err := parsePortRange(rangeSpec); err != nil {
+		return b.showError(s, c.Bot(), "❌ "+err.Error())
+	}
+
+	if err := b.cfg.SetRandomPort(idx, srv.RandomPort, rangeSpec, nil); err != nil {
+		return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+	}
+
+	// Включённый режим надо переприменить: блоки нарезаются из пула, а старые
+	// могли оказаться за его границами.
+	if srv.RandomPort {
+		_ = b.editOrSend(s, c.Bot(), "⏳ Применяю новый пул на сервере...", nil)
+		srv.RandomPortRange = rangeSpec
+		if err := b.applyRandomPort(idx, srv, parsePortBlocks(srv.RandomPortBlocks)); err != nil {
+			return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+		}
+	}
+	return b.showRandomPort(s, c.Bot(), uid)
 }
 
 // refreshedIface — имя интерфейса по факту. Обновляем его только если интерфейс
@@ -1161,6 +1464,8 @@ func (b *Bot) onText(c tele.Context) error {
 		return b.handleAdminAdd(c, s, text)
 	case ScreenInstallPort:
 		return b.handleInstallPort(c, s, text)
+	case ScreenRandomPortRange:
+		return b.handleRandomPortRange(c, s, text)
 	default:
 		return nil // ignore unrelated text
 	}
@@ -1590,7 +1895,7 @@ func (b *Bot) showAdminList(s *UserSession, bot *tele.Bot, uid int64) error {
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
 	for _, adminUID := range srv.AllowedUIDs {
-		label := fmt.Sprintf("%d", adminUID)
+		label := b.userTag(adminUID)
 		if adminUID == uid {
 			label += " (вы)"
 		}
@@ -1716,7 +2021,7 @@ func (b *Bot) showAdminEdit(s *UserSession, bot *tele.Bot, uid int64) error {
 	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnAdminBack.Unique)})
 	markup.Inline(rows...)
 
-	text := fmt.Sprintf("👤 Админ: %d\nСервер: %s", s.PendingAdminUID, srv.Name)
+	text := fmt.Sprintf("👤 Админ: %s\nСервер: %s", b.userTag(s.PendingAdminUID), srv.Name)
 	if s.PendingAdminUID == uid {
 		text += "\n(это вы)"
 	}

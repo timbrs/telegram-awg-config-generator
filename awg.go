@@ -112,6 +112,9 @@ type ClientData struct {
 	// «владелец неизвестен» (ключ создан до этой фичи или через приложение Amnezia) —
 	// такие ключи видны всем админам. Поле своё, Amnezia его игнорирует.
 	CreatorUID int64 `json:"creatorUid,omitempty"`
+	// ClientPort — UDP-порт в Endpoint клиента при режиме «случайный порт».
+	// 0 означает штатный ListenPort сервера. Поле своё, Amnezia его игнорирует.
+	ClientPort int `json:"clientPort,omitempty"`
 }
 
 type ClientEntry struct {
@@ -782,6 +785,20 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 		}
 	}
 
+	// Режим «случайный порт»: клиент шлёт трафик на свой порт, DNAT на сервере
+	// приводит его к порту AWG. Сам сервер при этом ничего не меняет — только
+	// Endpoint в клиентском конфиге.
+	endpointPort := srvParams.ListenPort
+	clientPort := 0
+	if srv.RandomPort {
+		if port, portErr := pickClientPort(srv); portErr != nil {
+			log.Printf("AWG (%s): случайный порт не выбран, отдаю штатный %s: %v", srv.Name, endpointPort, portErr)
+		} else {
+			clientPort = port
+			endpointPort = strconv.Itoa(port)
+		}
+	}
+
 	// Append [Peer] block to config via base64 to avoid shell escaping issues
 	peerBlock := fmt.Sprintf("\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n", pubKey, psk, allowedIPs)
 
@@ -800,6 +817,7 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 			DataSent:        "0 B",
 			LatestHandshake: "never",
 			CreatorUID:      creatorUID,
+			ClientPort:      clientPort,
 		},
 	}
 	clients = append(clients, newEntry)
@@ -815,10 +833,10 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 	// Build client config (AmneziaWG format).
 	// Endpoint берётся из EndpointHost() — публичный IPv4, даже если SSH идёт по IPv6.
 	endpointHost := srv.EndpointHost()
-	clientConf = BuildClientConfig(privKey, psk, newIP, endpointHost, srvParams.ListenPort, dns1, dns2, srvParams, clientIPv6, clientIPv6Mask)
+	clientConf = BuildClientConfig(privKey, psk, newIP, endpointHost, endpointPort, dns1, dns2, srvParams, clientIPv6, clientIPv6Mask)
 
 	// Build AmneziaVPN URI (non-fatal on error)
-	vpnURI, _, vpnErr := BuildAmneziaVPNURI(privKey, pubKey, psk, newIP, endpointHost, srvParams.ListenPort, srv.Name, dns1, dns2, srvParams, clientIPv6, clientIPv6Mask)
+	vpnURI, _, vpnErr := BuildAmneziaVPNURI(privKey, pubKey, psk, newIP, endpointHost, endpointPort, srv.Name, dns1, dns2, srvParams, clientIPv6, clientIPv6Mask)
 	if vpnErr != nil {
 		log.Printf("AmneziaVPN URI build failed: %v", vpnErr)
 	}

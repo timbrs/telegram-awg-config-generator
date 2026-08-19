@@ -28,6 +28,69 @@ func (b *Bot) startReportScheduler() {
 	log.Println("Планировщик отчётов запущен (ежедневно в 19:00)")
 }
 
+// profileRefreshInterval — как часто перечитывать профили админов у Telegram.
+// Раз в сутки: ники меняются редко, а getChat на каждого — это отдельный запрос.
+const profileRefreshInterval = 24 * time.Hour
+
+// startProfileRefresher держит профили админов свежими.
+//
+// Ник и имя записываются при обращении к боту, но админ может не заходить
+// месяцами — и в списках вместо имени будет голый UID. getChat отдаёт эти данные
+// и без входящих сообщений, если у пользователя есть чат с ботом; для тех, кто
+// боту никогда не писал, Telegram отвечает ошибкой — такие остаются с UID.
+func (b *Bot) startProfileRefresher() {
+	go func() {
+		// Первый проход — сразу после старта: обычно бот перезапускается как раз
+		// после правки config.yaml, где мог появиться новый админ.
+		b.refreshAdminProfiles()
+		for {
+			time.Sleep(profileRefreshInterval)
+			b.refreshAdminProfiles()
+		}
+	}()
+	log.Println("Обновление профилей админов запущено (раз в сутки)")
+}
+
+func (b *Bot) refreshAdminProfiles() {
+	cfg := b.cfg.Get()
+
+	seen := make(map[int64]bool)
+	var uids []int64
+	for _, srv := range cfg.Servers {
+		for _, uid := range srv.AllowedUIDs {
+			if uid != 0 && !seen[uid] {
+				seen[uid] = true
+				uids = append(uids, uid)
+			}
+		}
+	}
+
+	updated, failed := 0, 0
+	for i, uid := range uids {
+		if i > 0 {
+			// Telegram не любит очередь запросов вплотную, а спешить тут некуда.
+			time.Sleep(200 * time.Millisecond)
+		}
+		chat, err := b.bot.ChatByID(uid)
+		if err != nil {
+			// Обычное дело: человек никогда не писал боту — чата нет.
+			log.Printf("Профиль %d не получен: %v", uid, err)
+			failed++
+			continue
+		}
+		if b.state.SeeUser(uid, chat.Username, fullName(chat.FirstName, chat.LastName)) {
+			updated++
+		}
+	}
+
+	if updated > 0 {
+		if err := b.state.Save(); err != nil {
+			log.Printf("Сохранение профилей: %v", err)
+		}
+	}
+	log.Printf("Профили админов: опрошено %d, обновлено %d, без ответа %d", len(uids), updated, failed)
+}
+
 // clientTraffic holds traffic info for one client in the report.
 type clientTraffic struct {
 	Name  string

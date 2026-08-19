@@ -28,6 +28,14 @@ type ServerConfig struct {
 	AWGVersion    int       `yaml:"awg_version,omitempty"`       // 1/15/2/3/31 — кэш детекта версии протокола (major*10+minor у минорных)
 	AWGToolsVer   string    `yaml:"awg_tools_version,omitempty"` // "3.1.20260812" — для показа в UI
 	DNS           string    `yaml:"dns,omitempty"`               // DNS для клиентских конфигов (через запятую)
+	// Режим «случайный порт»: сервер принимает AWG на любом UDP-порту диапазона,
+	// каждый ключ получает свой порт в Endpoint (см. awg_randomport.go).
+	RandomPort      bool   `yaml:"random_port,omitempty"`
+	RandomPortRange string `yaml:"random_port_range,omitempty"` // пул, из которого нарезаются блоки
+	// RandomPortBlocks — реально проброшенные блоки («24500-24599»). Хранить
+	// обязательно: из них бот выдаёт порты клиентам, и по ним же собирается
+	// скрипт на сервере.
+	RandomPortBlocks []string `yaml:"random_port_blocks,omitempty"`
 }
 
 type AppConfig struct {
@@ -57,6 +65,14 @@ func (s ServerConfig) IfaceName() string {
 // ProtoVersion — закэшированная версия протокола AWG на сервере.
 func (s ServerConfig) ProtoVersion() AWGVersion {
 	return AWGVersion(s.AWGVersion)
+}
+
+// PortRange — диапазон UDP-портов для режима «случайный порт».
+func (s ServerConfig) PortRange() string {
+	if s.RandomPortRange == "" {
+		return defaultPortRange
+	}
+	return s.RandomPortRange
 }
 
 type ConfigManager struct {
@@ -180,6 +196,27 @@ func (cm *ConfigManager) SetAWGInfo(serverIdx int, info AWGVersionInfo, iface st
 		srv.Iface = "" // дефолт в YAML не пишем
 	} else if iface != "" {
 		srv.Iface = iface
+	}
+	return cm.saveLocked()
+}
+
+// SetRandomPort сохраняет состояние режима «случайный порт». Пустой rangeSpec
+// оставляет пул прежним, nil-блоки — прежние блоки.
+func (cm *ConfigManager) SetRandomPort(serverIdx int, enabled bool, rangeSpec string, blocks []string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if serverIdx < 0 || serverIdx >= len(cm.config.Servers) {
+		return fmt.Errorf("индекс сервера %d вне диапазона", serverIdx)
+	}
+
+	srv := &cm.config.Servers[serverIdx]
+	srv.RandomPort = enabled
+	if rangeSpec != "" {
+		srv.RandomPortRange = rangeSpec
+	}
+	if blocks != nil {
+		srv.RandomPortBlocks = blocks
 	}
 	return cm.saveLocked()
 }
