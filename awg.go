@@ -146,6 +146,9 @@ type ServerParams struct {
 	ExtraParamOrder []string
 	// Version — версия протокола, выведенная из набора параметров конфига.
 	Version AWGVersion
+	// ClientMTU — MTU для клиентских конфигов, посчитанный по S4 сервера и
+	// MTU его HOP-туннеля (см. mtu.go). 0 = не считали (парсинг без SSH).
+	ClientMTU int
 	// PeerAllowedIPs — AllowedIPs из всех [Peer]-секций awg0.conf. Нужен, чтобы
 	// видеть реально занятые адреса (в т.ч. клиентов, созданных самим Amnezia,
 	// которых может не быть в clientsTable).
@@ -332,7 +335,14 @@ func ReadServerConfig(srv ServerConfig) (*ServerParams, error) {
 	if err != nil {
 		return nil, fmt.Errorf("чтение awg конфига: %w", err)
 	}
-	return parseServerConfig(output)
+	params, err := parseServerConfig(output)
+	if err != nil {
+		return nil, err
+	}
+	// Считаем здесь, а не в parseServerConfig: MTU HOP-туннеля видно только с
+	// сервера, а парсер обязан оставаться чистой функцией для тестов.
+	params.ClientMTU = ClientMTU(params, endpointIsIPv6(srv.EndpointHost()), DetectHopMTU(srv))
+	return params, nil
 }
 
 // parseServerConfig разбирает текст awg0.conf. Вынесен из ReadServerConfig,
@@ -1095,6 +1105,12 @@ func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2 
 	}
 	sb.WriteString(fmt.Sprintf("DNS = %s\n", dnsLine))
 
+	// Без явного MTU awg-quick посчитает его сам и промахнётся ровно на S4
+	// (см. mtu.go) — каждый пакет данных поедет двумя IP-фрагментами.
+	if params.ClientMTU > 0 {
+		sb.WriteString(fmt.Sprintf("MTU = %d\n", params.ClientMTU))
+	}
+
 	// Параметры обфускации копируются с сервера как есть, в детерминированном порядке.
 	for _, key := range clientParamOrder(params) {
 		sb.WriteString(fmt.Sprintf("%s = %s\n", key, params.AWGParams[key]))
@@ -1217,6 +1233,7 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 	// AddPeer (BuildClientConfig до BuildAmneziaVPNURI).
 	local := &ServerParams{
 		PublicKey:       params.PublicKey,
+		ClientMTU:       params.ClientMTU,
 		ExtraParamOrder: params.ExtraParamOrder,
 		AWGParams:       make(map[string]string, len(params.AWGParams)+5),
 	}
@@ -1262,7 +1279,7 @@ func BuildAmneziaVPNURI(privKey, pubKey, psk, clientIP, serverIP, serverPort, se
 		"client_ip":             clientIP,
 		"hostName":              serverIP,
 		"port":                  portNum,
-		"mtu":                   "1376",
+		"mtu":                   clientMTUString(local),
 		"persistent_keep_alive": "25",
 		"allowed_ips":           []string{"0.0.0.0/0", "::/0"},
 	}
