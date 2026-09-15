@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/curve25519"
 )
@@ -115,6 +117,11 @@ type ClientData struct {
 	// ClientPort — UDP-порт в Endpoint клиента при режиме «случайный порт».
 	// 0 означает штатный ListenPort сервера. Поле своё, Amnezia его игнорирует.
 	ClientPort int `json:"clientPort,omitempty"`
+	// ClientPorts — весь набор портов, выданный клиенту («20150-20179,...»).
+	// Наборы разных клиентов пересекаются намеренно, поэтому поле ничего не
+	// резервирует: оно нужно, чтобы было видно, что именно клиенту выдали.
+	// Поле своё, Amnezia его игнорирует.
+	ClientPorts string `json:"clientPorts,omitempty"`
 }
 
 type ClientEntry struct {
@@ -127,6 +134,10 @@ type ClientEntry struct {
 type PeerBlock struct {
 	PublicKey  string
 	AllowedIPs string
+	// Name — комментарий сразу после [Peer]. Конфиги, собранные руками или
+	// скриптом (germany-bvps: «# client01»), держат в нём имя пира — без него
+	// восстановленный clientsTable состоит из безликих peer-1..peer-N.
+	Name string
 }
 
 type ServerParams struct {
@@ -215,11 +226,15 @@ func buildClientsFromPeers(peers []PeerBlock) []ClientEntry {
 			continue
 		}
 		n := len(entries) + 1
+		name := p.Name
+		if name == "" {
+			name = fmt.Sprintf("peer-%d", n)
+		}
 		entries = append(entries, ClientEntry{
 			ClientID: p.PublicKey,
 			UserData: ClientData{
 				AllowedIPs:      p.AllowedIPs,
-				ClientName:      fmt.Sprintf("peer-%d", n),
+				ClientName:      name,
 				CreationDate:    "unknown",
 				DataReceived:    "0 B",
 				DataSent:        "0 B",
@@ -385,7 +400,14 @@ func parseServerConfig(output string) (*ServerParams, error) {
 			curPeer = &PeerBlock{}
 			continue
 		}
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			// Первый комментарий внутри [Peer] считаем именем пира.
+			if section == "peer" && curPeer != nil && curPeer.Name == "" {
+				curPeer.Name = strings.TrimSpace(strings.TrimLeft(line, "#"))
+			}
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
@@ -752,25 +774,30 @@ func addHostToIPv6(ip net.IP, hostID int) {
 	}
 }
 
-func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string, vpnURI string, err error) {
+// AddPeer заводит новый ключ. allowedPorts непуст только в режиме «случайный
+// порт»: это набор портов сервера, разрешённых этому клиенту, в формате
+// awg-proxy («20150-20179,21500-21529»). Он едет в .conf комментарием, а
+// Endpoint остаётся с одним портом — иначе конфиг не откроется ничем, кроме
+// awg-proxy.
+func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string, allowedPorts string, vpnURI string, err error) {
 	privKey, pubKey, psk, err := GenerateKeyPair(srv)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	clients, err := ListClients(srv)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	srvParams, err := ReadServerConfig(srv)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	newIP, err := allocateIP(srvParams, clients)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	dns1, dns2 := resolveClientDNS(srv, srvParams)
@@ -801,11 +828,14 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 	endpointPort := srvParams.ListenPort
 	clientPort := 0
 	if srv.RandomPort {
-		if port, portErr := pickClientPort(srv); portErr != nil {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		awgPort, _ := strconv.Atoi(srvParams.ListenPort)
+		if ranges, port, portErr := pickClientPortSet(srv, awgPort, r); portErr != nil {
 			log.Printf("AWG (%s): случайный порт не выбран, отдаю штатный %s: %v", srv.Name, endpointPort, portErr)
 		} else {
 			clientPort = port
 			endpointPort = strconv.Itoa(port)
+			allowedPorts = clientPortsSpec(ranges)
 		}
 	}
 
@@ -813,7 +843,7 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 	peerBlock := fmt.Sprintf("\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n", pubKey, psk, allowedIPs)
 
 	if err := appendFileOnServer(srv, confPath(srv), []byte(peerBlock)); err != nil {
-		return "", "", fmt.Errorf("добавление пира в конфиг: %w", err)
+		return "", "", "", fmt.Errorf("добавление пира в конфиг: %w", err)
 	}
 
 	// Update clientsTable
@@ -828,16 +858,17 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 			LatestHandshake: "never",
 			CreatorUID:      creatorUID,
 			ClientPort:      clientPort,
+			ClientPorts:     allowedPorts,
 		},
 	}
 	clients = append(clients, newEntry)
 
 	if err := writeClientsTable(srv, clients); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	if err := reloadInterface(srv, false); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	// Build client config (AmneziaWG format).
@@ -851,7 +882,7 @@ func AddPeer(srv ServerConfig, name string, creatorUID int64) (clientConf string
 		log.Printf("AmneziaVPN URI build failed: %v", vpnErr)
 	}
 
-	return clientConf, vpnURI, nil
+	return clientConf, allowedPorts, vpnURI, nil
 }
 
 // reloadInterface перечитывает конфиг интерфейса.
@@ -1128,6 +1159,31 @@ func BuildClientConfig(privKey, psk, clientIP, serverIP, serverPort, dns1, dns2 
 	return sb.String()
 }
 
+// withAllowedPortsComment дописывает в .conf строку «# AllowedPorts = ...»
+// сразу после Endpoint.
+//
+// Именно комментарием: файл должен по-прежнему открываться любым клиентом
+// WireGuard, а список портов понимает только awg-proxy. Веб-конфигуратор
+// вытащит строку и соберёт из неё AWG_REMOTE. В QR и в vpn://-ключ этот
+// комментарий не попадает — там конфиг остаётся стандартным.
+func withAllowedPortsComment(conf, allowedPorts string) string {
+	if allowedPorts == "" {
+		return conf
+	}
+	lines := strings.Split(conf, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "Endpoint = ") {
+			continue
+		}
+		out := make([]string, 0, len(lines)+1)
+		out = append(out, lines[:i+1]...)
+		out = append(out, "# AllowedPorts = "+allowedPorts)
+		out = append(out, lines[i+1:]...)
+		return strings.Join(out, "\n")
+	}
+	return conf
+}
+
 // AmneziaVPN JSON config types
 type amneziaVPNConfig struct {
 	Containers           []amneziaContainer `json:"containers"`
@@ -1392,9 +1448,20 @@ type awgConfCandidate struct {
 // Порядок «docker → native» намеренный: контейнер AmneziaVPN пробуется первым,
 // потому что именно там живут реальные клиенты. Native — полноправная
 // альтернатива, а не замена.
-func detectAWGMode(ip, login, pass string) (*DetectedServer, error) {
+func detectAWGMode(base ServerConfig) (*DetectedServer, error) {
+	// Принимаем ServerConfig целиком, а не (ip, login, pass): у сервера может не
+	// быть пароля вовсе — на germany-bvps вход только по ключу (key_file).
+	tmpSrv := base
+	ip := tmpSrv.IP
 	// Name проставляем, иначе SSH-ошибки печатаются с пустым именем сервера.
-	tmpSrv := ServerConfig{Name: ip, IP: ip, Login: login, Pass: pass}
+	if tmpSrv.Name == "" {
+		tmpSrv.Name = ip
+	}
+	// Режим и пути СБРАСЫВАЕМ: детект должен выяснить их заново. Иначе у сервера,
+	// уже помеченного native, docker-проба ниже выполнит `awg show interfaces`
+	// напрямую по SSH, успешно его отработает — и режим ошибочно станет docker.
+	tmpSrv.Mode = ""
+	tmpSrv.AWGConfDir = ""
 
 	// --- Docker ---
 	if out, err := execAWG(tmpSrv, "awg show interfaces"); err == nil {

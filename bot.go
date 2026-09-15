@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -39,9 +40,11 @@ const (
 	ScreenInstallIPv6                // "Enable IPv6?"
 	ScreenInstallProgress            // installation in progress
 	ScreenVersionScan                // опрос версий AWG на серверах
-	ScreenRandomPortPick             // выбор сервера для настройки «случайного порта»
+	ScreenServerSettingsPick         // выбор сервера для настройки
+	ScreenServerSettings             // общий экран настроек сервера
+	ScreenServerIPv6                 // ввод IPv6-адреса сервера
 	ScreenRandomPort                 // экран режима «случайный порт»
-	ScreenRandomPortRange            // ввод диапазона портов
+	ScreenRandomPortRange            // ввод пула портов
 )
 
 // UserSession tracks the current UI state for a user.
@@ -82,8 +85,8 @@ type UserSession struct {
 	// минутами, и должен прерываться кнопкой.
 	VerScanID     int  // номер текущего опроса; новый опрос отменяет предыдущий
 	VerScanCancel bool // выставляется кнопкой «Прервать»
-	// Режим «случайный порт»
-	PendingRandomPortIdx int // индекс сервера, который настраивается
+	// Настройки сервера (IPv6, предпочтение протокола, случайный порт)
+	PendingSettingsIdx int // индекс сервера, который настраивается
 }
 
 // startVerScan объявляет начало нового опроса версий и возвращает его номер.
@@ -175,9 +178,14 @@ var (
 	btnRandomPortToggle = tele.InlineButton{Unique: "rpt"}
 	btnRandomPortRange  = tele.InlineButton{Unique: "rpr"}
 	btnRandomPortBack   = tele.InlineButton{Unique: "rpb"}
-	btnPagePrev         = tele.InlineButton{Unique: "ppv"}
-	btnPageNext         = tele.InlineButton{Unique: "pnx"}
-	btnNoop             = tele.InlineButton{Unique: "noop"}
+	// Настройки сервера
+	btnServerSettings     = tele.InlineButton{Unique: "svs"}
+	btnServerSettingsBack = tele.InlineButton{Unique: "svsb"}
+	btnServerIPv6         = tele.InlineButton{Unique: "sv6"}
+	btnServerPrefer       = tele.InlineButton{Unique: "svp"}
+	btnPagePrev           = tele.InlineButton{Unique: "ppv"}
+	btnPageNext           = tele.InlineButton{Unique: "pnx"}
+	btnNoop               = tele.InlineButton{Unique: "noop"}
 	// Add-server
 	btnAddServer = tele.InlineButton{Unique: "asv"}
 	// Admin management
@@ -309,7 +317,11 @@ func (b *Bot) Start() {
 	b.bot.Handle(&btnServerRenSel, b.cbServerRenameSelect)
 	b.bot.Handle(&btnServerVer, b.cbRefreshVersion)
 	b.bot.Handle(&btnVerScanStop, b.cbStopVersionScan)
-	b.bot.Handle(&btnRandomPort, b.cbRandomPort)
+	b.bot.Handle(&btnRandomPort, b.cbServerSettings)
+	b.bot.Handle(&btnServerSettings, b.cbServerSettings)
+	b.bot.Handle(&btnServerSettingsBack, b.cbServerSettingsBack)
+	b.bot.Handle(&btnServerIPv6, b.cbServerIPv6)
+	b.bot.Handle(&btnServerPrefer, b.cbServerPrefer)
 	b.bot.Handle(&btnRandomPortSel, b.cbRandomPortSelect)
 	b.bot.Handle(&btnRandomPortToggle, b.cbRandomPortToggle)
 	b.bot.Handle(&btnRandomPortRange, b.cbRandomPortRange)
@@ -400,12 +412,12 @@ func (b *Bot) showMainMenuWithHeader(s *UserSession, bot *tele.Bot, uid int64, h
 		serverLine = fmt.Sprintf("Нет доступных серверов (UID: %d)", uid)
 	case len(indices) == 1:
 		srv := cfg.Servers[indices[0]]
-		serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
+		serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.SSHHost())
 	default:
 		activeIdx, ok := b.state.GetActiveServer(uid)
 		if ok {
 			srv := cfg.Servers[activeIdx]
-			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.IP)
+			serverLine = fmt.Sprintf("🖥 Сервер: %s (%s)", srv.Name, srv.SSHHost())
 		} else {
 			serverLine = "🖥 Сервер не выбран"
 		}
@@ -566,7 +578,8 @@ func (b *Bot) showStatus(s *UserSession, bot *tele.Bot, srv ServerConfig, uid in
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📋 Сервер: %s (всего: %d)\n", srv.Name, len(clients)))
-	sb.WriteString(serverInfoLine(srv) + "\n\n")
+	sb.WriteString(serverInfoLine(srv) + "\n")
+	sb.WriteString(sshInfoLine(srv) + "\n\n")
 
 	if len(clients) == 0 {
 		sb.WriteString("Клиенты не найдены.")
@@ -726,7 +739,8 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 	} else {
 		for i, idx := range indices {
 			srv := cfg.Servers[idx]
-			text := fmt.Sprintf("%s (%s)%s", srv.Name, srv.IP, versionBadge(srv))
+			// В скобках — адрес, с которого пойдёт SSH: при prefer: ipv6 это не srv.IP.
+			text := fmt.Sprintf("%s (%s)%s", srv.Name, srv.SSHHost(), versionBadge(srv))
 			if hasActive && idx == activeIdx {
 				text += " ✅"
 			}
@@ -742,7 +756,7 @@ func (b *Bot) showServerList(s *UserSession, bot *tele.Bot, uid int64) error {
 	// Не «обновить версию»: так кнопка читается как апгрейд AWG на серверах.
 	// Бот только опрашивает серверы и обновляет свой кэш.
 	rows = append(rows, tele.Row{markup.Data("🔄 Проверить версии AWG", btnServerVer.Unique)})
-	rows = append(rows, tele.Row{markup.Data("🎲 Случайный порт", btnRandomPort.Unique)})
+	rows = append(rows, tele.Row{markup.Data("⚙️ Настройки сервера", btnServerSettings.Unique)})
 	rows = append(rows, tele.Row{markup.Data("↩ Меню", btnMenu.Unique)})
 	markup.Inline(rows...)
 
@@ -758,6 +772,46 @@ func serverInfoLine(srv ServerConfig) string {
 	}
 	parts = append(parts, srv.IfaceName())
 	return "⚙️ " + strings.Join(parts, " · ")
+}
+
+// ipFamilyLabel — «IPv4»/«IPv6» для адреса; пусто для DNS-имени.
+func ipFamilyLabel(host string) string {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	switch {
+	case ip == nil:
+		return ""
+	case ip.To4() != nil:
+		return "IPv4"
+	default:
+		return "IPv6"
+	}
+}
+
+// hostWithFamily — «2a01:db8::1 (IPv6)».
+func hostWithFamily(host string) string {
+	if family := ipFamilyLabel(host); family != "" {
+		return host + " (" + family + ")"
+	}
+	return host
+}
+
+// sshInfoLine — по какому адресу бот реально ходил на сервер в последний раз.
+//
+// Показывать именно фактический адрес важно из-за фолбэка в sshDial: при
+// выбранном IPv6 соединение могло уйти на запасной IPv4, и без этой строки
+// админ считал бы, что работает по IPv6.
+func sshInfoLine(srv ServerConfig) string {
+	preferred := srv.SSHHost()
+
+	rec, ok := LastSSHHost(srv)
+	if !ok {
+		return "🔗 SSH: " + hostWithFamily(preferred) + " — подключений ещё не было"
+	}
+	line := "🔗 SSH: " + hostWithFamily(rec.Host)
+	if rec.Host != preferred {
+		line += fmt.Sprintf(" — запасной, %s не ответил", hostWithFamily(preferred))
+	}
+	return line
 }
 
 // versionBadge — короткий бейдж версии для подписи кнопки сервера.
@@ -933,37 +987,39 @@ func resultLines(done []verScanResult) string {
 
 // --- Режим «случайный порт» ---
 
-func (b *Bot) cbRandomPort(c tele.Context) error {
+func (b *Bot) cbServerSettings(c tele.Context) error {
 	_ = c.Respond()
 	uid := c.Sender().ID
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
-	return b.showRandomPortPick(s, c.Bot(), uid)
+	return b.showServerSettingsPick(s, c.Bot(), uid)
 }
 
-func (b *Bot) showRandomPortPick(s *UserSession, bot *tele.Bot, uid int64) error {
-	s.setScreen(ScreenRandomPortPick)
+// showServerSettingsPick — выбор сервера для настройки. В списке только те, где
+// у пользователя есть право менять настройки: создатель или суперадмин.
+func (b *Bot) showServerSettingsPick(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.setScreen(ScreenServerSettingsPick)
 
 	indices := b.cfg.ServersForUser(uid)
-	if len(indices) == 0 {
-		return b.showError(s, bot, fmt.Sprintf("❌ У вас нет доступных серверов.\nВаш UID: %d", uid))
-	}
 	cfg := b.cfg.Get()
 
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
 	for i, idx := range indices {
 		srv := cfg.Servers[idx]
-		state := "выкл"
-		if srv.RandomPort {
-			state = fmt.Sprintf("вкл, блоков: %d", len(srv.RandomPortBlocks))
+		if !canManageServer(uid, srv) {
+			continue
 		}
-		rows = append(rows, tele.Row{markup.Data(fmt.Sprintf("%s — %s", srv.Name, state), btnRandomPortSel.Unique, strconv.Itoa(i+1))})
+		rows = append(rows, tele.Row{markup.Data(fmt.Sprintf("%s (%s)", srv.Name, srv.IP), btnRandomPortSel.Unique, strconv.Itoa(i+1))})
+	}
+	if len(rows) == 0 {
+		return b.showError(s, bot, fmt.Sprintf(
+			"❌ Настройки сервера меняет его создатель (первый админ) или получатель отчётов.\nВаш UID: %d", uid))
 	}
 	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnServerList.Unique)})
 	markup.Inline(rows...)
 
-	return b.editOrSend(s, bot, "🎲 Случайный порт — выберите сервер:", markup)
+	return b.editOrSend(s, bot, "⚙️ Настройки — выберите сервер:", markup)
 }
 
 func (b *Bot) cbRandomPortSelect(c tele.Context) error {
@@ -981,8 +1037,8 @@ func (b *Bot) cbRandomPortSelect(c tele.Context) error {
 		return b.showError(s, c.Bot(), fmt.Sprintf("❌ Укажите номер от 1 до %d.", len(indices)))
 	}
 
-	s.withLock(func() { s.PendingRandomPortIdx = indices[num-1] })
-	return b.showRandomPort(s, c.Bot(), uid)
+	s.withLock(func() { s.PendingSettingsIdx = indices[num-1] })
+	return b.showServerSettings(s, c.Bot(), uid)
 }
 
 func (b *Bot) cbRandomPortBack(c tele.Context) error {
@@ -993,30 +1049,198 @@ func (b *Bot) cbRandomPortBack(c tele.Context) error {
 	return b.showRandomPort(s, c.Bot(), uid)
 }
 
-// randomPortTargetServer — сервер, который сейчас настраивается, с проверкой
-// прав на каждое действие: индекс живёт в сессии и переживает перезагрузку
-// конфига, а его нулевое значение — валидный индекс первого сервера.
-func (b *Bot) randomPortTargetServer(s *UserSession, uid int64) (int, ServerConfig, error) {
+func (b *Bot) cbServerSettingsBack(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+	return b.showServerSettings(s, c.Bot(), uid)
+}
+
+// settingsTargetServer — сервер, который сейчас настраивается, с проверкой прав
+// на КАЖДОЕ действие: индекс живёт в сессии и переживает перезагрузку конфига,
+// а его нулевое значение — валидный индекс первого сервера.
+func (b *Bot) settingsTargetServer(s *UserSession, uid int64) (int, ServerConfig, error) {
 	idx := 0
-	s.withLock(func() { idx = s.PendingRandomPortIdx })
+	s.withLock(func() { idx = s.PendingSettingsIdx })
 
 	cfg := b.cfg.Get()
 	if idx < 0 || idx >= len(cfg.Servers) {
 		return 0, ServerConfig{}, fmt.Errorf("❌ Сервер не найден")
 	}
 	srv := cfg.Servers[idx]
-	for _, allowed := range srv.AllowedUIDs {
-		if allowed == uid {
-			return idx, srv, nil
-		}
+	if !canManageServer(uid, srv) {
+		return 0, ServerConfig{}, fmt.Errorf(
+			"❌ Настройки сервера меняет его создатель (первый админ) или получатель отчётов.\nВаш UID: %d", uid)
 	}
-	return 0, ServerConfig{}, fmt.Errorf("❌ Нет доступа к этому серверу.\nВаш UID: %d", uid)
+	return idx, srv, nil
+}
+
+// showServerSettings — общий экран настроек одного сервера.
+func (b *Bot) showServerSettings(s *UserSession, bot *tele.Bot, uid int64) error {
+	s.setScreen(ScreenServerSettings)
+
+	_, srv, err := b.settingsTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, bot, err.Error())
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("⚙️ Настройки — %s\n\n", srv.Name))
+	sb.WriteString(fmt.Sprintf("IPv4: %s\n", srv.IP))
+	if srv.IPv6Host != "" {
+		sb.WriteString(fmt.Sprintf("IPv6: %s\n", srv.IPv6Host))
+	} else {
+		sb.WriteString("IPv6: не задан\n")
+	}
+	sb.WriteString(fmt.Sprintf("SSH-подключение бота: %s\n", preferLabel(srv)))
+	sb.WriteString(fmt.Sprintf("Endpoint ключей: %s\n", srv.EndpointHost()))
+
+	if srv.RandomPort {
+		sb.WriteString(fmt.Sprintf("Случайный порт: вкл, блоков %d\n", len(srv.RandomPortBlocks)))
+	} else {
+		sb.WriteString("Случайный порт: выкл\n")
+	}
+
+	sb.WriteString("\nIPv6 нужен только боту: он задаёт, каким адресом тот ходит на сервер по SSH " +
+		"(второй адрес остаётся запасным). Ключи выдаются по IPv4 в любом случае.")
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(
+		tele.Row{markup.Data("🌐 IPv6-адрес", btnServerIPv6.Unique)},
+		tele.Row{markup.Data(preferButtonLabel(srv), btnServerPrefer.Unique)},
+		tele.Row{markup.Data("🎲 Случайный порт", btnRandomPortBack.Unique)},
+		tele.Row{markup.Data("↩ Назад", btnRandomPort.Unique)},
+	)
+	return b.editOrSend(s, bot, sb.String(), markup)
+}
+
+func preferLabel(srv ServerConfig) string {
+	if srv.Prefer == preferIPv6 {
+		if srv.IPv6Host == "" {
+			return "IPv6 (адрес не задан — используется IPv4)"
+		}
+		return "IPv6"
+	}
+	return "IPv4"
+}
+
+func preferButtonLabel(srv ServerConfig) string {
+	if srv.Prefer == preferIPv6 {
+		return "🔀 Переключить на IPv4"
+	}
+	return "🔀 Переключить на IPv6"
+}
+
+func (b *Bot) cbServerPrefer(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	idx, srv, err := b.settingsTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	next := preferIPv6
+	if srv.Prefer == preferIPv6 {
+		next = preferIPv4
+	}
+	if next == preferIPv6 && srv.IPv6Host == "" {
+		return b.showError(s, c.Bot(), "❌ Сначала задайте IPv6-адрес сервера.")
+	}
+
+	if err := b.cfg.SetServerNet(idx, srv.IPv6Host, next); err != nil {
+		return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+	}
+
+	// Проверяем, что по выбранному протоколу сервер вообще отвечает: SSH сам
+	// откатится на запасной адрес, но админ должен знать, что предпочтение
+	// не работает.
+	if _, err := SSHRunTimeout(preferOnly(srv, next), "true", 15*time.Second); err != nil {
+		log.Printf("Проверка %s по %s (%s): %v", srv.Name, next, srv.IPv6Host, err)
+		markup := &tele.ReplyMarkup{}
+		markup.Inline(tele.Row{markup.Data("↩ К настройкам", btnServerSettingsBack.Unique)})
+		return b.editOrSend(s, c.Bot(), fmt.Sprintf(
+			"⚠️ Предпочтение сохранено (%s), но по этому адресу сервер не ответил на SSH.\n\n"+
+				"Бот продолжит ходить по запасному адресу, так что доступ не потерян. "+
+				"Ключи выдаются по IPv4 и от этой настройки не зависят.", strings.ToUpper(next)), markup)
+	}
+	return b.showServerSettings(s, c.Bot(), uid)
+}
+
+// preferOnly — копия конфига без запасного адреса: нужна, чтобы проверить
+// доступность именно выбранного протокола, а не фолбэка.
+func preferOnly(srv ServerConfig, prefer string) ServerConfig {
+	if prefer == preferIPv6 {
+		srv.IP = srv.IPv6Host
+	} else {
+		srv.IPv6Host = ""
+	}
+	srv.Prefer = preferIPv4
+	return srv
+}
+
+func (b *Bot) cbServerIPv6(c tele.Context) error {
+	_ = c.Respond()
+	uid := c.Sender().ID
+	s := b.getSession(uid, c.Chat().ID)
+	syncMessageID(s, c)
+
+	_, srv, err := b.settingsTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	s.setScreen(ScreenServerIPv6)
+	current := srv.IPv6Host
+	if current == "" {
+		current = "не задан"
+	}
+	text := fmt.Sprintf("🌐 IPv6-адрес сервера %s\n\nСейчас: %s\n\n"+
+		"Введите публичный IPv6-адрес сервера (например 2a01:db8::1).\n"+
+		"Это адрес самого сервера, а не VPN-подсеть клиентов.\n\n"+
+		"Используется только для SSH-подключения бота — Endpoint в ключах остаётся на IPv4.\n\n"+
+		"Чтобы удалить адрес, отправьте «-».", srv.Name, current)
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(tele.Row{markup.Data("↩ Назад", btnServerSettingsBack.Unique)})
+	return b.editOrSend(s, c.Bot(), text, markup)
+}
+
+func (b *Bot) handleServerIPv6(c tele.Context, s *UserSession, input string) error {
+	uid := c.Sender().ID
+	idx, srv, err := b.settingsTargetServer(s, uid)
+	if err != nil {
+		return b.showError(s, c.Bot(), err.Error())
+	}
+
+	addr := strings.TrimSpace(input)
+	if addr == "-" {
+		// Снятый адрес не должен оставить сервер с предпочтением, которое некуда
+		// применить.
+		if err := b.cfg.SetServerNet(idx, "", preferIPv4); err != nil {
+			return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+		}
+		return b.showServerSettings(s, c.Bot(), uid)
+	}
+
+	addr = strings.Trim(addr, "[]")
+	ip := net.ParseIP(addr)
+	if ip == nil || ip.To4() != nil {
+		return b.showError(s, c.Bot(), "❌ Это не похоже на IPv6-адрес. Пример: 2a01:db8::1")
+	}
+
+	if err := b.cfg.SetServerNet(idx, ip.String(), srv.Prefer); err != nil {
+		return b.showError(s, c.Bot(), formatError(srv, "", err, ""))
+	}
+	return b.showServerSettings(s, c.Bot(), uid)
 }
 
 func (b *Bot) showRandomPort(s *UserSession, bot *tele.Bot, uid int64) error {
 	s.setScreen(ScreenRandomPort)
 
-	_, srv, err := b.randomPortTargetServer(s, uid)
+	_, srv, err := b.settingsTargetServer(s, uid)
 	if err != nil {
 		return b.showError(s, bot, err.Error())
 	}
@@ -1041,13 +1265,24 @@ func (b *Bot) showRandomPort(s *UserSession, bot *tele.Bot, uid int64) error {
 		default:
 			sb.WriteString("На сервере: ⚠️ правил нет. Нажмите «Переприменить»\n")
 		}
+		if statusErr == nil {
+			if conflicts, err := RandomPortConflicts(srv); err == nil && len(conflicts) > 0 {
+				sb.WriteString("⚠️ Блоки перекрыты чужими правилами NAT — ключи с портом оттуда могут не подключаться:\n")
+				for _, c := range conflicts {
+					sb.WriteString("  • " + c + "\n")
+				}
+				sb.WriteString("Уберите пересечение в чужом правиле или перевыберите блоки " +
+					"(ключи с портами из старых блоков тогда перестанут подключаться).\n")
+			}
+		}
 	} else {
 		sb.WriteString("Состояние: выключен\n")
 	}
 	sb.WriteString(fmt.Sprintf("Пул для выбора блоков: %s\n", srv.PortRange()))
 
 	sb.WriteString(fmt.Sprintf("\nЧто делает: бот выбирает %d случайных блоков по %d портов, "+
-		"проверяет, что там никто не слушает, и пробрасывает их на AWG. "+
+		"проверяет, что там никто не слушает и порты не перехвачены чужими правилами NAT, "+
+		"и пробрасывает их на AWG. "+
 		"Каждый новый ключ получает свой случайный порт из этих блоков — "+
 		"один и тот же порт у всех заметен для DPI.\n\n", portBlockCount, portBlockSize))
 	sb.WriteString("Как устроено: правила DNAT в цепочке " + randomPortChain + " (nat/PREROUTING), " +
@@ -1071,7 +1306,7 @@ func (b *Bot) showRandomPort(s *UserSession, bot *tele.Bot, uid int64) error {
 		rows = append(rows, tele.Row{markup.Data("✅ Включить", btnRandomPortToggle.Unique, "on")})
 	}
 	rows = append(rows, tele.Row{markup.Data("✏️ Пул портов", btnRandomPortRange.Unique)})
-	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnRandomPort.Unique)})
+	rows = append(rows, tele.Row{markup.Data("↩ Назад", btnServerSettingsBack.Unique)})
 	markup.Inline(rows...)
 
 	return b.editOrSend(s, bot, sb.String(), markup)
@@ -1083,7 +1318,7 @@ func (b *Bot) cbRandomPortToggle(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 
-	idx, srv, err := b.randomPortTargetServer(s, uid)
+	idx, srv, err := b.settingsTargetServer(s, uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
 	}
@@ -1129,7 +1364,7 @@ func (b *Bot) cbRandomPortRange(c tele.Context) error {
 	s := b.getSession(uid, c.Chat().ID)
 	syncMessageID(s, c)
 
-	_, srv, err := b.randomPortTargetServer(s, uid)
+	_, srv, err := b.settingsTargetServer(s, uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
 	}
@@ -1149,7 +1384,7 @@ func (b *Bot) cbRandomPortRange(c tele.Context) error {
 
 func (b *Bot) handleRandomPortRange(c tele.Context, s *UserSession, input string) error {
 	uid := c.Sender().ID
-	idx, srv, err := b.randomPortTargetServer(s, uid)
+	idx, srv, err := b.settingsTargetServer(s, uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), err.Error())
 	}
@@ -1466,6 +1701,8 @@ func (b *Bot) onText(c tele.Context) error {
 		return b.handleInstallPort(c, s, text)
 	case ScreenRandomPortRange:
 		return b.handleRandomPortRange(c, s, text)
+	case ScreenServerIPv6:
+		return b.handleServerIPv6(c, s, text)
 	default:
 		return nil // ignore unrelated text
 	}
@@ -1485,7 +1722,7 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 
 	_ = b.editOrSend(s, c.Bot(), "⏳ Создаю ключ...", nil)
 
-	clientConf, vpnURI, err := AddPeer(*srv, name, uid)
+	clientConf, allowedPorts, vpnURI, err := AddPeer(*srv, name, uid)
 	if err != nil {
 		return b.showError(s, c.Bot(), formatError(*srv, "", err, ""))
 	}
@@ -1504,8 +1741,11 @@ func (b *Bot) handleNewCreate(c tele.Context, s *UserSession, input string) erro
 		"iPhone: AmneziaWG → «+» → добавьте .conf файл или отсканируйте QR.\n" +
 		"Android: откройте .conf файл → «Открыть в AmneziaVPN»."
 
+	// В файл едет конфиг с комментарием о выданных портах — его читает
+	// веб-конфигуратор. QR выше и vpn://-ключ ниже остаются чистыми: их
+	// разбирают приложения Amnezia, которым лишняя строка ни к чему.
 	confDoc := &tele.Document{
-		File:     tele.FromReader(strings.NewReader(clientConf)),
+		File:     tele.FromReader(strings.NewReader(withAllowedPortsComment(clientConf, allowedPorts))),
 		FileName: sanitizeFileName(srv.Name),
 		Caption:  confCaption,
 	}
@@ -1744,7 +1984,12 @@ func (b *Bot) handleAddServerPass(c tele.Context, s *UserSession, input string) 
 		return b.editOrSend(s, c.Bot(), fmt.Sprintf("❌ SSH подключение не удалось: %v", sshErr), markup)
 	}
 
-	det, err := detectAWGMode(s.PendingServerIP, s.PendingServerLogin, pass)
+	det, err := detectAWGMode(ServerConfig{
+		Name:  s.PendingServerIP,
+		IP:    s.PendingServerIP,
+		Login: s.PendingServerLogin,
+		Pass:  pass,
+	})
 	if err != nil {
 		// SSH works but AWG not found — offer installation
 		s.setScreen(ScreenInstallConfirm)
@@ -1786,6 +2031,10 @@ func (b *Bot) handleAddServerName(c tele.Context, s *UserSession, input string) 
 			Login:       s.PendingServerLogin,
 			Pass:        s.PendingServerPass,
 			AllowedUIDs: []int64{uid},
+			// Создатель сервера сразу суперадмин: он видит все ключи и получает
+			// отчёты. Иначе первый же добавленный им админ прятал бы от него свои
+			// ключи, а отчёты не приходили бы никому.
+			ReportUIDs:  []int64{uid},
 			Mode:        s.PendingServerMode,
 			AWGConfDir:  s.PendingServerDir,
 			Port:        s.PendingInstallPort,
@@ -2123,6 +2372,20 @@ func sanitizeFileName(name string) string {
 
 // isSuperAdmin сообщает, является ли пользователь суперадмином сервера.
 // Суперадмин — это получатель отчётов (report_uids); он видит все ключи.
+// canManageServer — право менять настройки сервера (случайный порт, IPv6,
+// предпочтение протокола). Есть у создателя сервера (первый UID в allowed_uids)
+// и у суперадминов из report_uids.
+//
+// В отличие от canManageReports, создатель не теряет это право с появлением
+// суперадминов: настройки сети — это про сам сервер, а не про модель видимости
+// ключей, которую суперадминство и регулирует.
+func canManageServer(uid int64, srv ServerConfig) bool {
+	if isSuperAdmin(uid, srv) {
+		return true
+	}
+	return len(srv.AllowedUIDs) > 0 && srv.AllowedUIDs[0] == uid
+}
+
 func isSuperAdmin(uid int64, srv ServerConfig) bool {
 	for _, u := range srv.ReportUIDs {
 		if u == uid {

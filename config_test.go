@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -266,5 +267,67 @@ servers: []
 
 	if cm.Get().BotToken != "token2" {
 		t.Errorf("expected token2 after reload, got '%s'", cm.Get().BotToken)
+	}
+}
+
+// Создатель сервера должен быть суперадмином: иначе отчёты по серверу не
+// приходят никому, а ключи других админов не видит даже владелец.
+func TestEnsureCreatorIsSuperAdmin(t *testing.T) {
+	servers := []ServerConfig{
+		{Name: "пустой report_uids", AllowedUIDs: []int64{100, 200}},
+		{Name: "суперадмин уже есть", AllowedUIDs: []int64{100, 200}, ReportUIDs: []int64{200}},
+		{Name: "без админов вовсе"},
+	}
+
+	if !ensureCreatorIsSuperAdmin(servers) {
+		t.Fatal("ожидалось изменение: у первого сервера пустой report_uids")
+	}
+
+	if len(servers[0].ReportUIDs) != 1 || servers[0].ReportUIDs[0] != 100 {
+		t.Errorf("создатель не попал в report_uids: %v", servers[0].ReportUIDs)
+	}
+	// Снятого вручную суперадмина возвращать нельзя — иначе настройку не отменить.
+	if len(servers[1].ReportUIDs) != 1 || servers[1].ReportUIDs[0] != 200 {
+		t.Errorf("существующий список суперадминов изменён: %v", servers[1].ReportUIDs)
+	}
+	if len(servers[2].ReportUIDs) != 0 {
+		t.Errorf("серверу без админов суперадмин взяться неоткуда: %v", servers[2].ReportUIDs)
+	}
+
+	// Повторный проход ничего не меняет.
+	if ensureCreatorIsSuperAdmin(servers) {
+		t.Error("второй проход не должен ничего менять")
+	}
+}
+
+// Миграция должна доезжать до файла: иначе она повторялась бы при каждом старте.
+func TestLoadWritesCreatorToReportUIDs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "bot_token: \"t\"\nservers:\n  - name: s1\n    ip: 1.2.3.4\n    login: root\n    pass: p\n    allowed_uids: [111, 222]\n    report_uids: []\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := NewConfigManager(path)
+	if err := cm.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cm.Get().Servers[0].ReportUIDs; len(got) != 1 || got[0] != 111 {
+		t.Fatalf("report_uids после загрузки = %v", got)
+	}
+
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved), "111") {
+		t.Errorf("создатель не сохранён в файл:\n%s", saved)
+	}
+
+	// Файл переписан ботом — CheckReload не должен считать это внешней правкой
+	// и уходить на второй круг.
+	if err := cm.CheckReload(); err != nil {
+		t.Errorf("CheckReload после миграции: %v", err)
 	}
 }

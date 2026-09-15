@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -10,11 +11,18 @@ import (
 )
 
 type ServerConfig struct {
-	Name          string    `yaml:"name"`
-	IP            string    `yaml:"ip"`
-	EndpointIP    string    `yaml:"endpoint_ip,omitempty"` // публичный адрес для Endpoint в клиентских конфигах (обычно IPv4); если пусто — используется IP
-	Login         string    `yaml:"login"`
-	Pass          string    `yaml:"pass"`
+	Name       string `yaml:"name"`
+	IP         string `yaml:"ip"`
+	EndpointIP string `yaml:"endpoint_ip,omitempty"` // публичный адрес для Endpoint в клиентских конфигах (обычно IPv4); если пусто — используется IP
+	Login      string `yaml:"login"`
+	Pass       string `yaml:"pass"`
+	// KeyFile — путь к приватному ssh-ключу на машине бота. Нужен для серверов,
+	// где парольный вход отключён (`PasswordAuthentication no`): у germany-bvps
+	// это единственный способ войти. Поддерживается `~` в начале пути.
+	// Если задан и ключ, и пароль — сначала пробуется ключ.
+	KeyFile string `yaml:"key_file,omitempty"`
+	// KeyPass — passphrase ключа, если он зашифрован.
+	KeyPass       string    `yaml:"key_pass,omitempty"`
 	AllowedUIDs   []int64   `yaml:"allowed_uids"`
 	ReportUIDs    []int64   `yaml:"report_uids"`
 	LastConnected time.Time `yaml:"last_connected"`
@@ -36,21 +44,77 @@ type ServerConfig struct {
 	// обязательно: из них бот выдаёт порты клиентам, и по ним же собирается
 	// скрипт на сервере.
 	RandomPortBlocks []string `yaml:"random_port_blocks,omitempty"`
+	// IPv6Host — публичный IPv6-адрес самого сервера (не VPN-подсеть). Нужен
+	// только боту: по нему он может ходить на сервер по SSH.
+	IPv6Host string `yaml:"ipv6,omitempty"`
+	// Prefer — какой протокол предпочитать при SSH-подключении бота: "ipv6" или
+	// "ipv4" (по умолчанию). На клиентские конфиги не влияет: Endpoint ключей
+	// всегда берётся из EndpointHost().
+	Prefer string `yaml:"prefer,omitempty"`
 }
+
+// Значения ServerConfig.Prefer.
+const (
+	preferIPv4 = "ipv4"
+	preferIPv6 = "ipv6"
+)
 
 type AppConfig struct {
 	BotToken string         `yaml:"bot_token"`
 	Servers  []ServerConfig `yaml:"servers"`
 }
 
+// PrefersIPv6 — предпочитать ли IPv6 при SSH-подключении к серверу.
+func (s ServerConfig) PrefersIPv6() bool {
+	return s.Prefer == preferIPv6 && s.IPv6Host != ""
+}
+
 // EndpointHost возвращает адрес, который попадёт в Endpoint клиентских VPN-конфигов.
-// Если задан EndpointIP (обычно публичный IPv4) — используется он, иначе IP,
-// по которому бот подключается к серверу по SSH (может быть IPv6).
+// Если задан EndpointIP (обычно публичный IPv4) — используется он, иначе IP.
+//
+// Поля IPv6Host и Prefer сюда НЕ входят: они описывают, как бот ходит на сервер
+// по SSH, а ключи выдаются по IPv4 независимо от этого.
 func (s ServerConfig) EndpointHost() string {
 	if s.EndpointIP != "" {
 		return s.EndpointIP
 	}
 	return s.IP
+}
+
+// SSHHost — адрес, с которого начнётся следующее SSH-подключение.
+func (s ServerConfig) SSHHost() string {
+	hosts := s.SSHHosts()
+	if len(hosts) == 0 {
+		return s.IP
+	}
+	return hosts[0]
+}
+
+// SSHHosts — адреса для SSH в порядке предпочтения. Второй адрес нужен как
+// фолбэк: IPv6 может не работать с машины, где крутится бот, и терять из-за
+// этого доступ к серверу нельзя.
+func (s ServerConfig) SSHHosts() []string {
+	var hosts []string
+	add := func(h string) {
+		if h == "" {
+			return
+		}
+		for _, existing := range hosts {
+			if existing == h {
+				return
+			}
+		}
+		hosts = append(hosts, h)
+	}
+
+	if s.PrefersIPv6() {
+		add(s.IPv6Host)
+		add(s.IP)
+		return hosts
+	}
+	add(s.IP)
+	add(s.IPv6Host)
+	return hosts
 }
 
 // IfaceName — имя AWG-интерфейса; awg0 по умолчанию (так называет его Amnezia).
@@ -110,7 +174,33 @@ func (cm *ConfigManager) loadLocked() error {
 
 	cm.config = cfg
 	cm.modTime = info.ModTime()
+
+	// Сервер без единого суперадмина — это сервер, чьи отчёты не приходят никому,
+	// а ключи, созданные другими админами, не видит даже владелец. Достраиваем
+	// создателя, но только в пустой список: снятого вручную суперадмина
+	// возвращать нельзя, иначе настройку было бы не отменить.
+	if ensureCreatorIsSuperAdmin(cm.config.Servers) {
+		if err := cm.saveLocked(); err != nil {
+			return fmt.Errorf("сохранение report_uids создателя: %w", err)
+		}
+		log.Printf("Конфиг: создатели серверов добавлены в report_uids")
+	}
 	return nil
+}
+
+// ensureCreatorIsSuperAdmin вписывает создателя сервера (первый UID в
+// allowed_uids) в пустой report_uids. Возвращает true, если что-то изменилось.
+func ensureCreatorIsSuperAdmin(servers []ServerConfig) bool {
+	changed := false
+	for i := range servers {
+		srv := &servers[i]
+		if len(srv.AllowedUIDs) == 0 || len(srv.ReportUIDs) > 0 {
+			continue
+		}
+		srv.ReportUIDs = []int64{srv.AllowedUIDs[0]}
+		changed = true
+	}
+	return changed
 }
 
 func (cm *ConfigManager) CheckReload() error {
@@ -217,6 +307,34 @@ func (cm *ConfigManager) SetRandomPort(serverIdx int, enabled bool, rangeSpec st
 	}
 	if blocks != nil {
 		srv.RandomPortBlocks = blocks
+	}
+	return cm.saveLocked()
+}
+
+// SetServerNet сохраняет сетевые настройки сервера: публичный IPv6-адрес и
+// предпочитаемый протокол обращения к нему.
+func (cm *ConfigManager) SetServerNet(serverIdx int, ipv6Host, prefer string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if serverIdx < 0 || serverIdx >= len(cm.config.Servers) {
+		return fmt.Errorf("индекс сервера %d вне диапазона", serverIdx)
+	}
+	if prefer != "" && prefer != preferIPv4 && prefer != preferIPv6 {
+		return fmt.Errorf("предпочтение должно быть %q или %q", preferIPv4, preferIPv6)
+	}
+
+	srv := &cm.config.Servers[serverIdx]
+	srv.IPv6Host = ipv6Host
+	if ipv6Host == "" {
+		// Предпочитать IPv6 без адреса нечему — иначе EndpointHost молча
+		// вернулся бы к IPv4, а UI показывал бы «IPv6».
+		prefer = preferIPv4
+	}
+	if prefer == preferIPv4 {
+		srv.Prefer = "" // дефолт в YAML не пишем
+	} else {
+		srv.Prefer = prefer
 	}
 	return cm.saveLocked()
 }

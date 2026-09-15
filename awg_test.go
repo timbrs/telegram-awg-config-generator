@@ -1745,3 +1745,32 @@ AllowedIPs = 10.8.1.2/32
 		t.Errorf("ожидался 1 блок [Peer], получено %d\n%s", n, out)
 	}
 }
+
+// Строка с портами едет в .conf комментарием, сразу после Endpoint: обычный
+// клиент WireGuard её пропустит, а конфигуратор соберёт из неё AWG_REMOTE.
+func TestWithAllowedPortsComment(t *testing.T) {
+	nl := string(rune(10))
+	conf := "[Interface]" + nl + "PrivateKey = k" + nl + nl + "[Peer]" + nl +
+		"Endpoint = 1.2.3.4:20160" + nl + "AllowedIPs = 0.0.0.0/0" + nl
+
+	got := withAllowedPortsComment(conf, "20150-20179,21500-21529")
+	lines := strings.Split(got, nl)
+	if lines[4] != "Endpoint = 1.2.3.4:20160" {
+		t.Fatalf("Endpoint сдвинулся: %q", lines[4])
+	}
+	if lines[5] != "# AllowedPorts = 20150-20179,21500-21529" {
+		t.Fatalf("комментарий не встал после Endpoint: %q", lines[5])
+	}
+	if lines[6] != "AllowedIPs = 0.0.0.0/0" {
+		t.Fatalf("остаток конфига поехал: %q", lines[6])
+	}
+
+	// Без набора портов конфиг обязан остаться байт-в-байт прежним — именно он
+	// уходит в QR и в vpn://-ключ.
+	if withAllowedPortsComment(conf, "") != conf {
+		t.Error("пустой набор не должен менять конфиг")
+	}
+	if noEndpoint := "[Interface]" + nl; withAllowedPortsComment(noEndpoint, "443") != noEndpoint {
+		t.Error("без Endpoint вставлять комментарий некуда")
+	}
+}
